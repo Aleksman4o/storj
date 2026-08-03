@@ -92,9 +92,21 @@ func (ac *AmnestyClient) Close() error {
 // ReportBadPiece adds a bad piece report to the batch for the given satellite.
 // Reports are sent in batches to improve efficiency.
 func (ac *AmnestyClient) ReportBadPiece(ctx context.Context, satellite storj.NodeID, pieceID storj.PieceID) error {
+	return ac.ReportBadPieceWithReason(ctx, satellite, pieceID, pb.LostPieceReason_HASH_MISMATCH)
+}
+
+// ReportBadPieceWithReason adds a bad piece report with the specified reason to the batch for the
+// given satellite. Reports are sent in batches to improve efficiency.
+func (ac *AmnestyClient) ReportBadPieceWithReason(
+	ctx context.Context,
+	satellite storj.NodeID,
+	pieceID storj.PieceID,
+	reason pb.LostPieceReason,
+) error {
 	ac.log.Debug("adding bad piece to batch",
 		zap.Stringer("satellite", satellite),
 		zap.Stringer("piece_id", pieceID),
+		zap.Stringer("reason", reason),
 	)
 
 	ac.mu.Lock()
@@ -115,7 +127,7 @@ func (ac *AmnestyClient) ReportBadPiece(ctx context.Context, satellite storj.Nod
 
 	batch.pieces = append(batch.pieces, &pb.LostPiece{
 		PieceId: pieceID,
-		Reason:  pb.LostPieceReason_HASH_MISMATCH,
+		Reason:  reason,
 	})
 
 	// If we've reached the batch size, send immediately

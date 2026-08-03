@@ -43,7 +43,7 @@ type Store struct {
 	today     func() uint32          // hook for getting the current timestamp
 	lock      *os.File               // lock file to prevent multiple processes from using the same store
 	valid     func(Key, []byte) bool // valid callback for reconciliation.
-	amnesty   func(context.Context, []Key)
+	amnesty   AmnestyCallback
 
 	lfc *logCollection                   // collection of log files ready to be written into
 	lru *multiLRUCache[string, *os.File] // cache of open file handles
@@ -88,6 +88,14 @@ type Store struct {
 	fakes struct {
 		tableInfo *platform.DiskInfo
 		logInfo   *platform.DiskInfo
+
+		compactionCopy     func(io.Writer, io.Reader, int64) (int64, error)
+		compactionReadAt   func(io.ReaderAt, []byte, int64) (int, error)
+		compactionWrite    func(io.Writer, []byte) (int, error)
+		compactionTruncate func(*os.File, int64) error
+		compactionSync     func(*os.File) error
+		compactionStat     func(*os.File) (os.FileInfo, error)
+		salvageableReadErr func(error) bool
 	}
 }
 
@@ -105,7 +113,7 @@ func NewStore(
 	tablePath string,
 	log *zap.Logger,
 	valid func(Key, []byte) bool,
-	amnesty func(context.Context, []Key),
+	amnesty AmnestyCallback,
 ) (_ *Store, err error) {
 	defer mon.Task()(&ctx)(&err)
 
@@ -121,7 +129,7 @@ func NewStore(
 		valid = func(k Key, b []byte) bool { return true }
 	}
 	if amnesty == nil {
-		amnesty = func(context.Context, []Key) {}
+		amnesty = func(context.Context, []Key, AmnestyReason) {}
 	}
 
 	s := &Store{
@@ -349,7 +357,7 @@ func NewStore(
 						zap.String("path", lf.path),
 						zap.Int("invalid_count", len(invalid)),
 					)
-					s.amnesty(ctx, invalid)
+					s.amnesty(ctx, invalid, AmnestyReasonHashMismatch)
 				}
 			} else {
 				s.stats.logsMatched++
@@ -400,7 +408,7 @@ func NewStore(
 					zap.String("path", "<missing>"),
 					zap.Int("invalid_count", len(invalid)),
 				)
-				s.amnesty(ctx, invalid)
+				s.amnesty(ctx, invalid, AmnestyReasonHashMismatch)
 			}
 		}
 	}
@@ -927,9 +935,13 @@ func (s *Store) Compact(ctx context.Context, args CompactArguments) (err error) 
 	// until we have no log files left to rewrite. this does more work (reads and writes the hash
 	// table each time we need to write a log file) but ensures we use minimal extra disk space when
 	// we need to rewrite multiple log files.
+	var salvageBudget *salvageBudget
+	if s.cfg.Compaction.Salvage {
+		salvageBudget = newSalvageBudget(s.cfg.Compaction.MaxLogSize)
+	}
 	for {
 		compactionRounds++
-		completed, err := s.compactOnce(ctx, today, expired, restored, args.ShouldTrash)
+		completed, err := s.compactOnce(ctx, today, expired, restored, args.ShouldTrash, salvageBudget)
 		if err != nil {
 			return err
 		} else if completed {
@@ -946,6 +958,7 @@ func (s *Store) compactOnce(
 	expired func(e Expiration) bool,
 	restored func(e Expiration) bool,
 	shouldTrash func(ctx context.Context, key Key, created time.Time) bool,
+	salvageBudget *salvageBudget,
 ) (completed bool, err error) {
 	defer mon.Task()(&ctx)(&err)
 
@@ -985,6 +998,15 @@ func (s *Store) compactOnce(
 		// recDiskLength returns the length on disk of a record including the footer.
 		recDiskLength = func(rec Record) uint64 { return uint64(rec.Length) + RecordSize }
 	)
+	var salvage *salvageRound
+	if salvageBudget != nil {
+		salvage = salvageBudget.newRound()
+		defer func() {
+			if err != nil {
+				salvage.markAborted()
+			}
+		}()
+	}
 
 	// collect statistics about the hash table and how live each of the log files are.
 	nset := uint64(0)
@@ -1241,8 +1263,11 @@ func (s *Store) compactOnce(
 		s.stats.totalRecords.Store(uint64(len(ri.records)))
 		s.stats.processedRecords.Store(0)
 
-		// rewrite each record and update the record in the index.
-		for i := range ri.records {
+		// Rewrite each record and update the record in the index. Reuse the slice so records proven
+		// lost by salvage are not discoverable in the second table pass.
+		records := ri.records
+		ri.records = records[:0]
+		for i := range records {
 			s.stats.processedRecords.Add(1) // bump the number of records processed for progress reporting.
 
 			if err := func() error {
@@ -1250,11 +1275,14 @@ func (s *Store) compactOnce(
 					return err
 				}
 
-				rec, err := s.rewriteRecord(ctx, ri.records[i], rewriteCandidates)
+				rec, lost, err := s.rewriteRecordForCompaction(ctx, records[i], rewriteCandidates, salvage)
 				if err != nil {
 					return Error.Wrap(err)
 				}
-				ri.records[i] = rec
+				if lost {
+					return nil
+				}
+				ri.add(rec)
 
 				s.stats.dataRewritten.Add(recDiskLength(rec))
 				rewrittenCtr.Add(recDiskLength(rec))
@@ -1330,6 +1358,12 @@ func (s *Store) compactOnce(
 			return true, nil
 		}
 
+		// A record proven lost during the ordered rewrite must not be copied or inserted into the
+		// newly committed table.
+		if salvage != nil && salvage.has(rec.Key) {
+			return true, nil
+		}
+
 		// if the log is being rewritten, copy the record into the a different log file.
 		if rewrite[rec.Log] {
 			// if we already rewrote the record earlier, then update the record to be the new
@@ -1339,9 +1373,12 @@ func (s *Store) compactOnce(
 			if i, ok := ri.findKey(rec.Key); ok && !s.cfg.Store.IgnoreRewrittenIndex {
 				rec.Log, rec.Offset = ri.records[i].Log, ri.records[i].Offset
 			} else {
-				rewrittenRec, err := s.rewriteRecord(ctx, rec, rewriteCandidates)
+				rewrittenRec, lost, err := s.rewriteRecordForCompaction(ctx, rec, rewriteCandidates, salvage)
 				if err != nil {
 					return false, Error.Wrap(err)
+				}
+				if lost {
+					return true, nil
 				}
 				rec = rewrittenRec
 
@@ -1426,6 +1463,13 @@ func (s *Store) compactOnce(
 		return true, nil
 	})
 
+	// The new table is committed and active, so it is now safe to report records that salvage
+	// deliberately omitted.
+	if salvageBudget != nil {
+		salvageBudget.commit(salvage)
+	}
+	s.reportSalvage(ctx, salvage)
+
 	// log information about important events that happened to records during the writing of the new
 	// hashtbl.
 	if ce := s.log.Check(zapcore.InfoLevel, "hashtbl rewritten"); ce != nil {
@@ -1498,11 +1542,28 @@ func (s *Store) checkFreeSpace(ctx context.Context, tableAmount, logsAmount uint
 }
 
 func (s *Store) rewriteRecord(ctx context.Context, rec Record, rewriteCandidates map[uint64]bool) (_ Record, err error) {
+	rec, _, err = s.rewriteRecordForCompaction(ctx, rec, rewriteCandidates, nil)
+	return rec, err
+}
+
+func (s *Store) rewriteRecordForCompaction(
+	ctx context.Context,
+	rec Record,
+	rewriteCandidates map[uint64]bool,
+	salvage *salvageRound,
+) (_ Record, lost bool, err error) {
 	defer mon.Task()(&ctx)(&err)
+
+	if salvage != nil && salvage.beyondKnownEOF(rec) {
+		if err := salvage.add(rec, salvageCauseTruncated); err != nil {
+			return rec, false, err
+		}
+		return rec, true, nil
+	}
 
 	r, err := s.readerForRecord(ctx, rec)
 	if err != nil {
-		return rec, Error.Wrap(err)
+		return rec, false, Error.Wrap(err)
 	}
 	defer r.Release() // same as r.Close() but no error to worry about.
 
@@ -1524,7 +1585,7 @@ func (s *Store) rewriteRecord(ctx context.Context, rec Record, rewriteCandidates
 	for into == nil || rewriteCandidates[into.id] || into.id == rec.Log {
 		into, err = s.acquireLogFile(rec.Expires.Time())
 		if err != nil {
-			return rec, Error.Wrap(err)
+			return rec, false, Error.Wrap(err)
 		}
 		defer s.lfc.Include(into) //nolint intentionally defer in the loop
 	}
@@ -1532,7 +1593,7 @@ func (s *Store) rewriteRecord(ctx context.Context, rec Record, rewriteCandidates
 	// get the current offset so that we are sure we have the correct spot for the record.
 	offset, err := into.fh.Seek(0, io.SeekEnd)
 	if err != nil {
-		return rec, Error.Wrap(err)
+		return rec, false, Error.Wrap(err)
 	}
 
 	// round up the offset+length+rec to the next preallocate size as long as it won't be larger
@@ -1547,21 +1608,76 @@ func (s *Store) rewriteRecord(ctx context.Context, rec Record, rewriteCandidates
 	}
 
 	// copy the record data.
-	if _, err := io.CopyN(into.fh, from, int64(rec.Length)); err != nil {
+	copyRecord := io.CopyN
+	if s.fakes.compactionCopy != nil {
+		copyRecord = s.fakes.compactionCopy
+	}
+	if _, err := copyRecord(into.fh, from, int64(rec.Length)); err != nil {
 		// if we couldn't write the data, we should abort the write operation and attempt to reclaim
 		// space by truncating to the saved offset.
-		_ = into.fh.Truncate(offset)
+		if salvage == nil {
+			_ = into.fh.Truncate(offset)
 
-		statSize := int64(-1)
-		if fi, statErr := r.fh.Stat(); statErr == nil {
-			statSize = fi.Size()
+			statSize := int64(-1)
+			if fi, statErr := r.fh.Stat(); statErr == nil {
+				statSize = fi.Size()
+			}
+			return rec, false, Error.New("writing into compacted log (rec=%v) (from=%v) (size=%d): %w",
+				rec,
+				r.fh.Name(),
+				statSize,
+				err,
+			)
 		}
-		return rec, Error.New("writing into compacted log (rec=%v) (from=%v) (size=%d): %w",
-			rec,
-			r.fh.Name(),
-			statSize,
-			err,
-		)
+
+		if rollbackErr := s.rollbackSalvageWrite(into.fh, offset); rollbackErr != nil {
+			return rec, false, Error.New("compaction copy failed and destination rollback failed: %w",
+				errs.Combine(err, rollbackErr))
+		}
+
+		sourceSize, statErr := s.compactionSourceSize(r.fh)
+		if statErr != nil {
+			return rec, false, Error.Wrap(statErr)
+		}
+		if recordBeyondEOF(rec, sourceSize) {
+			salvage.rememberEOF(rec.Log, sourceSize)
+			if err := salvage.add(rec, salvageCauseTruncated); err != nil {
+				return rec, false, err
+			}
+			return rec, true, nil
+		}
+
+		readErr, writeErr := s.copyRecordChecked(ctx, into.fh, r.fh, rec.Offset, rec.Length)
+		if writeErr != nil {
+			rollbackErr := s.rollbackSalvageWrite(into.fh, offset)
+			return rec, false, Error.New("writing into compacted log during checked copy: %w",
+				errs.Combine(writeErr, rollbackErr))
+		}
+		if readErr != nil {
+			if rollbackErr := s.rollbackSalvageWrite(into.fh, offset); rollbackErr != nil {
+				return rec, false, Error.New("checked source read failed and destination rollback failed: %w",
+					errs.Combine(readErr, rollbackErr))
+			}
+
+			sourceSize, statErr = s.compactionSourceSize(r.fh)
+			if statErr != nil {
+				return rec, false, Error.Wrap(statErr)
+			}
+			if recordBeyondEOF(rec, sourceSize) {
+				salvage.rememberEOF(rec.Log, sourceSize)
+				if err := salvage.add(rec, salvageCauseTruncated); err != nil {
+					return rec, false, err
+				}
+				return rec, true, nil
+			}
+			if !s.salvageableSourceReadError(readErr) {
+				return rec, false, Error.New("reading compaction source during checked copy: %w", readErr)
+			}
+			if err := salvage.add(rec, salvageCauseReadFailure); err != nil {
+				return rec, false, err
+			}
+			return rec, true, nil
+		}
 	}
 
 	// update the record location.
@@ -1575,8 +1691,13 @@ func (s *Store) rewriteRecord(ctx context.Context, rec Record, rewriteCandidates
 	if _, err := into.fh.Write(buf[:]); err != nil {
 		// if we can't add the record, we should abort the write operation and attempt to reclaim
 		// space by tuncating to the saved offset.
-		_ = into.fh.Truncate(offset)
-		return rec, Error.New("writing record into compacted log: %w", err)
+		if salvage == nil {
+			_ = into.fh.Truncate(offset)
+			return rec, false, Error.New("writing record into compacted log: %w", err)
+		}
+		rollbackErr := s.rollbackSalvageWrite(into.fh, offset)
+		return rec, false, Error.New("writing record into compacted log: %w",
+			errs.Combine(err, rollbackErr))
 	}
 
 	// increase our in-memory estimate of the size of the log file for sorting. we use store to
@@ -1586,12 +1707,12 @@ func (s *Store) rewriteRecord(ctx context.Context, rec Record, rewriteCandidates
 	// if the size is over the max size, close the file handle.
 	if endingSize >= s.cfg.Compaction.MaxLogSize {
 		if err := into.Close(); err != nil {
-			return rec, Error.Wrap(err)
+			return rec, false, Error.Wrap(err)
 		}
 	}
 
 	// return the updated record.
-	return rec, nil
+	return rec, false, nil
 }
 
 // writeHintFile writes out a hint file for faster fsck. It should only be called when the Store is

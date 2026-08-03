@@ -787,8 +787,8 @@ func newTestStore(t testing.TB, cfg Config, opts ...any) *testStore {
 	var valid func(Key, []byte) bool
 	checkOptions(opts, func(t WithValid) { valid = t })
 
-	var amnesty func(context.Context, []Key)
-	checkOptions(opts, func(t WithAmnesty) { amnesty = t })
+	var amnesty AmnestyCallback
+	checkOptions(opts, func(t WithAmnesty) { amnesty = AmnestyCallback(t) })
 
 	s, err := NewStore(t.Context(), cfg, t.TempDir(), "", newMemoryLogger(), valid, amnesty)
 	assert.NoError(t, err)
@@ -966,7 +966,7 @@ func newTestDB(
 	checkOptions(opts, func(t WithShouldTrash) { cbs.ShouldTrash = t })
 	checkOptions(opts, func(t WithLastRestore) { cbs.LastRestore = t })
 	checkOptions(opts, func(t WithValid) { cbs.Valid = t })
-	checkOptions(opts, func(t WithAmnesty) { cbs.Amnesty = t })
+	checkOptions(opts, func(t WithAmnesty) { cbs.Amnesty = AmnestyCallback(t) })
 
 	db, err := New(t.Context(), cfg, t.TempDir(), "", newMemoryLogger(), cbs)
 	assert.NoError(t, err)
@@ -1059,7 +1059,7 @@ type (
 	WithLastRestore func(context.Context) time.Time
 	WithRestoreTime time.Time
 	WithValid       func(Key, []byte) bool
-	WithAmnesty     func(context.Context, []Key)
+	WithAmnesty     AmnestyCallback
 )
 
 func checkOptionsBool[T ~bool](opts []any, cb func(T)) (found bool) {
