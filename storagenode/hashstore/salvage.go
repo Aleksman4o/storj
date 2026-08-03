@@ -30,6 +30,15 @@ const (
 	salvageCauseReadFailure
 )
 
+// SalvageStats contains runtime totals for compaction salvage.
+type SalvageStats struct {
+	SuccessfulRounds uint64
+	LostPieces       uint64
+	LostBytes        uint64
+	AffectedLogs     uint64
+	AbortedRounds    uint64
+}
+
 // salvageBudget contains data loss committed during one Compact call. It prevents separate atomic
 // rounds in the same compaction from collectively exceeding the salvage limits.
 type salvageBudget struct {
@@ -170,9 +179,20 @@ func (round *salvageRound) add(rec Record, cause salvageCause) error {
 	return nil
 }
 
-func (round *salvageRound) markAborted() {
+func (s *Store) markSalvageAborted(round *salvageRound) {
 	if round.observedLoss {
+		s.stats.salvageAborted.Add(1)
 		mon.Meter("compaction_salvage_aborted").Mark(1)
+	}
+}
+
+func (s *Store) salvageStats() SalvageStats {
+	return SalvageStats{
+		SuccessfulRounds: s.stats.salvageRounds.Load(),
+		LostPieces:       s.stats.salvageLostPieces.Load(),
+		LostBytes:        s.stats.salvageLostBytes.Load(),
+		AffectedLogs:     s.stats.salvageAffectedLogs.Load(),
+		AbortedRounds:    s.stats.salvageAborted.Load(),
 	}
 }
 
@@ -219,6 +239,10 @@ func (s *Store) reportSalvage(ctx context.Context, round *salvageRound) {
 	mon.Meter("compaction_salvage_lost_records").Mark(len(keys))
 	mon.Meter("compaction_salvage_lost_bytes").Mark64(int64(round.lostBytes))
 	mon.Meter("compaction_salvage_affected_logs").Mark(len(logIDs))
+	s.stats.salvageRounds.Add(1)
+	s.stats.salvageLostPieces.Add(uint64(len(keys)))
+	s.stats.salvageLostBytes.Add(round.lostBytes)
+	s.stats.salvageAffectedLogs.Add(uint64(len(logIDs)))
 
 	s.amnesty(ctx, keys, AmnestyReasonReadFailure)
 }
