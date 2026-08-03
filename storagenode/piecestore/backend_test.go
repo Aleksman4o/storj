@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/spacemonkeygo/monkit/v3"
 	"github.com/stretchr/testify/require"
 	"github.com/zeebo/mwc"
 
@@ -18,6 +19,35 @@ import (
 	"storj.io/storj/storagenode/hashstore"
 	"storj.io/storj/storagenode/retain"
 )
+
+func TestHashStoreBackend_CompactionStats(t *testing.T) {
+	ctx := testcontext.New(t)
+
+	config := hashstore.CreateDefaultConfig(hashstore.TableKind_HashTbl, false)
+	config.Compaction.Salvage = true
+	backend, err := NewHashStoreBackend(ctx, config, t.TempDir(), "", nil, nil, nil, nil)
+	require.NoError(t, err)
+	defer ctx.Check(backend.Close)
+
+	satellites := []storj.NodeID{{2}, {1}}
+	for _, satellite := range satellites {
+		writer, err := backend.Writer(ctx, satellite, storj.PieceID{1}, pb.PieceHashAlgorithm_BLAKE3, time.Time{})
+		require.NoError(t, err)
+		require.NoError(t, writer.Commit(ctx, &pb.PieceHeader{Hash: writer.Hash()}))
+	}
+
+	stats := backend.CompactionStats()
+	require.Len(t, stats, 2)
+	require.Equal(t, storj.NodeID{1}, stats[0].SatelliteID)
+	require.Equal(t, storj.NodeID{2}, stats[1].SatelliteID)
+	require.True(t, backend.SalvageEnabled())
+
+	metrics := monkit.Collect(backend)
+	satelliteTag := stats[0].SatelliteID.String()
+	require.Contains(t, metrics, "hashstore,satellite="+satelliteTag+" CompactionFailures")
+	require.Contains(t, metrics, "hashstore,satellite="+satelliteTag+" Salvage.LostPieces")
+	require.Contains(t, metrics, "hashstore,db=s0,satellite="+satelliteTag+" Salvage.AbortedRounds")
+}
 
 func TestHashstoreBackendTrash(t *testing.T) {
 	ctx := testcontext.New(t)

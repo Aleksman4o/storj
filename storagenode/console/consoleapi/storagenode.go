@@ -54,6 +54,25 @@ func (dashboard *StorageNode) StorageNode(w http.ResponseWriter, r *http.Request
 	}
 }
 
+// Compaction handles compaction statistics API requests.
+func (dashboard *StorageNode) Compaction(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	var err error
+	defer mon.Task()(&ctx)(&err)
+
+	w.Header().Set(contentType, applicationJSON)
+
+	data, err := dashboard.service.GetCompactionData(ctx)
+	if err != nil {
+		dashboard.serveJSONError(w, http.StatusInternalServerError, ErrStorageNodeAPI.Wrap(err))
+		return
+	}
+
+	if err := json.NewEncoder(w).Encode(data); err != nil {
+		dashboard.log.Error("failed to encode json response", zap.Error(ErrStorageNodeAPI.Wrap(err)))
+	}
+}
+
 // Satellites handles satellites API request.
 func (dashboard *StorageNode) Satellites(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()

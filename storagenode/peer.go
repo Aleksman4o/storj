@@ -905,6 +905,7 @@ func New(log *zap.Logger, full *identity.FullIdentity, db DB, revocationDB exten
 			port,
 			peer.Contact.QUICStats,
 			peer.Storage2.SpaceReport,
+			peer.Storage2.HashStoreBackend,
 		)
 		if err != nil {
 			return nil, errs.Combine(err, peer.Close())

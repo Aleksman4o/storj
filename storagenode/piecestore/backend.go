@@ -145,6 +145,11 @@ func (hsb *HashStoreBackend) LogsPath() string {
 	return hsb.logsPath
 }
 
+// SalvageEnabled reports whether compaction salvage is enabled.
+func (hsb *HashStoreBackend) SalvageEnabled() bool {
+	return hsb.cfg.Compaction.Salvage
+}
+
 // Close closes the HashStoreBackend.
 func (hsb *HashStoreBackend) Close() error {
 	hsb.mu.Lock()
@@ -164,29 +169,39 @@ func (hsb *HashStoreBackend) dbsCopy() map[storj.NodeID]*hashstore.DB {
 	return maps.Clone(hsb.dbs)
 }
 
+// SatelliteCompactionStats contains a hashstore statistics snapshot for one satellite.
+type SatelliteCompactionStats struct {
+	SatelliteID storj.NodeID
+	Database    hashstore.DBStats
+	Stores      [2]hashstore.StoreStats
+}
+
+// CompactionStats returns hashstore statistics sorted by satellite ID.
+func (hsb *HashStoreBackend) CompactionStats() []SatelliteCompactionStats {
+	dbs := hsb.dbsCopy()
+	stats := make([]SatelliteCompactionStats, 0, len(dbs))
+	for id, db := range dbs {
+		dbStats, s0Stats, s1Stats := db.Stats()
+		stats = append(stats, SatelliteCompactionStats{
+			SatelliteID: id,
+			Database:    dbStats,
+			Stores:      [2]hashstore.StoreStats{s0Stats, s1Stats},
+		})
+	}
+
+	sort.Slice(stats, func(i, j int) bool {
+		return stats[i].SatelliteID.String() < stats[j].SatelliteID.String()
+	})
+	return stats
+}
+
 // Stats implements monkit.StatSource.
 func (hsb *HashStoreBackend) Stats(cb func(key monkit.SeriesKey, field string, val float64)) {
-	type IDDB struct {
-		id storj.NodeID
-		db *hashstore.DB
-	}
-
-	dbs := hsb.dbsCopy()
-	iddbs := make([]IDDB, 0, len(dbs))
-	for id, db := range dbs {
-		iddbs = append(iddbs, IDDB{id, db})
-	}
-
-	sort.Slice(iddbs, func(i, j int) bool {
-		return iddbs[i].id.String() < iddbs[j].id.String()
-	})
-
-	for _, iddb := range iddbs {
-		dbStat, s0Stat, s1Stat := iddb.db.Stats()
-		taggedSeries := monkit.NewSeriesKey("hashstore").WithTag("satellite", iddb.id.String())
-		monkit.StatSourceFromStruct(taggedSeries, dbStat).Stats(cb)
-		monkit.StatSourceFromStruct(taggedSeries.WithTag("db", "s0"), s0Stat).Stats(cb)
-		monkit.StatSourceFromStruct(taggedSeries.WithTag("db", "s1"), s1Stat).Stats(cb)
+	for _, stats := range hsb.CompactionStats() {
+		taggedSeries := monkit.NewSeriesKey("hashstore").WithTag("satellite", stats.SatelliteID.String())
+		monkit.StatSourceFromStruct(taggedSeries, stats.Database).Stats(cb)
+		monkit.StatSourceFromStruct(taggedSeries.WithTag("db", "s0"), stats.Stores[0]).Stats(cb)
+		monkit.StatSourceFromStruct(taggedSeries.WithTag("db", "s1"), stats.Stores[1]).Stats(cb)
 	}
 }
 
