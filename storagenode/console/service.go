@@ -20,6 +20,7 @@ import (
 	"storj.io/storj/storagenode/monitor"
 	"storj.io/storj/storagenode/operator"
 	"storj.io/storj/storagenode/payouts/estimatedpayouts"
+	"storj.io/storj/storagenode/piecestore"
 	"storj.io/storj/storagenode/pricing"
 	"storj.io/storj/storagenode/reputation"
 	"storj.io/storj/storagenode/satellites"
@@ -47,6 +48,7 @@ type Service struct {
 	satelliteDB    satellites.DB
 	contact        *contact.Service
 	spaceReport    monitor.SpaceReport
+	hashStore      *piecestore.HashStoreBackend
 
 	estimation *estimatedpayouts.Service
 	version    *checker.Service
@@ -67,7 +69,7 @@ func NewService(log *zap.Logger, bandwidth bandwidth.DB, version *checker.Servic
 	reputationDB reputation.DB, storageUsageDB storageusage.DB, pricingDB pricing.DB, satelliteDB satellites.DB,
 	pingStats *contact.PingStats, contact *contact.Service, estimation *estimatedpayouts.Service,
 	walletFeatures operator.WalletFeatures, port string, quicStats *contact.QUICStats,
-	spaceReport monitor.SpaceReport) (*Service, error) {
+	spaceReport monitor.SpaceReport, hashStore *piecestore.HashStoreBackend) (*Service, error) {
 	if log == nil {
 		return nil, errs.New("log can't be nil")
 	}
@@ -92,6 +94,10 @@ func NewService(log *zap.Logger, bandwidth bandwidth.DB, version *checker.Servic
 		return nil, errs.New("estimation service can't be nil")
 	}
 
+	if hashStore == nil {
+		return nil, errs.New("hash store can't be nil")
+	}
+
 	return &Service{
 		log:            log,
 		trust:          trust,
@@ -111,6 +117,7 @@ func NewService(log *zap.Logger, bandwidth bandwidth.DB, version *checker.Servic
 		quicStats:      quicStats,
 		configuredPort: port,
 		spaceReport:    spaceReport,
+		hashStore:      hashStore,
 	}, nil
 }
 

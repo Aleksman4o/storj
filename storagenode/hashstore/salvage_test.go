@@ -64,6 +64,12 @@ func testStore_CompactionSalvagesTruncatedLog(
 	assert.NoError(t, lf.fh.Truncate(int64(rec.Offset)+int64(rec.Length)/2))
 
 	assert.NoError(t, s.Compact(t.Context(), CompactArguments{}))
+	stats := s.Stats()
+	assert.Equal(t, stats.Salvage.SuccessfulRounds, uint64(1))
+	assert.Equal(t, stats.Salvage.LostPieces, uint64(2))
+	assert.That(t, stats.Salvage.LostBytes > 0)
+	assert.Equal(t, stats.Salvage.AffectedLogs, uint64(1))
+	assert.Equal(t, stats.Salvage.AbortedRounds, uint64(0))
 
 	s.AssertRead(good, WithDataSize(512))
 	s.AssertNotExist(lost0)
@@ -300,6 +306,12 @@ func TestStore_CompactionDoesNotReportSalvageBeforeCommit(t *testing.T) {
 	assert.Error(t, err)
 	assert.That(t, strings.Contains(err.Error(), "unable to commit newly compacted hashtbl"))
 	assert.Equal(t, mon.Meter("compaction_salvage_aborted").Total(), abortedBefore+1)
+	stats := s.Stats()
+	assert.Equal(t, stats.Compactions, uint64(2))
+	assert.Equal(t, stats.CompactionFailures, uint64(1))
+	assert.Equal(t, stats.Salvage.SuccessfulRounds, uint64(0))
+	assert.Equal(t, stats.Salvage.LostPieces, uint64(0))
+	assert.Equal(t, stats.Salvage.AbortedRounds, uint64(1))
 	assert.NoError(t, os.Remove(nextTable))
 
 	assert.Equal(t, s.tbl.Handle().Name(), oldTable)
