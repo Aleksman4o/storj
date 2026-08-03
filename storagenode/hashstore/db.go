@@ -221,14 +221,16 @@ type DBStats struct {
 	LogsMatched    int // number of log files checked and matched
 	LogsMismatched int // number of log files checked and mismatched
 
-	Compacting      bool        // if true, a background compaction is in progress.
-	Compactions     uint64      // total number of compactions that finished on either store.
-	Active          int         // which store is currently active
-	LogsRewritten   uint64      // total number of log files attempted to be rewritten.
-	DataRewritten   memory.Size // total number of bytes of data rewritten.
-	DataReclaimed   memory.Size // number of bytes reclaimed in the log files.
-	DataReclaimable memory.Size // number of bytes potentially reclaimable in the log files.
-	FreeRequired    memory.Size // number of bytes required to be reserved for compactions.
+	Compacting         bool        // if true, a background compaction is in progress.
+	Compactions        uint64      // total number of compactions that finished on either store.
+	CompactionFailures uint64      // total number of failed compactions on either store.
+	Active             int         // which store is currently active
+	LogsRewritten      uint64      // total number of log files attempted to be rewritten.
+	DataRewritten      memory.Size // total number of bytes of data rewritten.
+	DataReclaimed      memory.Size // number of bytes reclaimed in the log files.
+	DataReclaimable    memory.Size // number of bytes potentially reclaimable in the log files.
+	FreeRequired       memory.Size // number of bytes required to be reserved for compactions.
+	Salvage            SalvageStats
 }
 
 // Stats returns statistics about the database and underlying stores.
@@ -277,13 +279,21 @@ func (d *DB) Stats() (DBStats, StoreStats, StoreStats) {
 		LogsMatched:    s0st.LogsMatched + s1st.LogsMatched,
 		LogsMismatched: s0st.LogsMismatched + s1st.LogsMismatched,
 
-		Compacting:      compacting,
-		Compactions:     s0st.Compactions + s1st.Compactions,
-		Active:          active,
-		LogsRewritten:   s0st.LogsRewritten + s1st.LogsRewritten,
-		DataRewritten:   s0st.DataRewritten + s1st.DataRewritten,
-		DataReclaimed:   s0st.DataReclaimed + s1st.DataReclaimed,
-		DataReclaimable: s0st.DataReclaimable + s1st.DataReclaimable,
+		Compacting:         compacting,
+		Compactions:        s0st.Compactions + s1st.Compactions,
+		CompactionFailures: s0st.CompactionFailures + s1st.CompactionFailures,
+		Active:             active,
+		LogsRewritten:      s0st.LogsRewritten + s1st.LogsRewritten,
+		DataRewritten:      s0st.DataRewritten + s1st.DataRewritten,
+		DataReclaimed:      s0st.DataReclaimed + s1st.DataReclaimed,
+		DataReclaimable:    s0st.DataReclaimable + s1st.DataReclaimable,
+		Salvage: SalvageStats{
+			SuccessfulRounds: s0st.Salvage.SuccessfulRounds + s1st.Salvage.SuccessfulRounds,
+			LostPieces:       s0st.Salvage.LostPieces + s1st.Salvage.LostPieces,
+			LostBytes:        s0st.Salvage.LostBytes + s1st.Salvage.LostBytes,
+			AffectedLogs:     s0st.Salvage.AffectedLogs + s1st.Salvage.AffectedLogs,
+			AbortedRounds:    s0st.Salvage.AbortedRounds + s1st.Salvage.AbortedRounds,
+		},
 	}, s0st, s1st
 }
 

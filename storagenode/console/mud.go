@@ -17,6 +17,7 @@ import (
 	"storj.io/storj/storagenode/monitor"
 	"storj.io/storj/storagenode/operator"
 	"storj.io/storj/storagenode/payouts/estimatedpayouts"
+	"storj.io/storj/storagenode/piecestore"
 	"storj.io/storj/storagenode/pricing"
 	"storj.io/storj/storagenode/reputation"
 	"storj.io/storj/storagenode/satellites"
@@ -31,7 +32,8 @@ func Module(ball *mud.Ball) {
 		reputationDB reputation.DB, storageUsageDB storageusage.DB, pricingDB pricing.DB, satelliteDB satellites.DB,
 		pingStats *contact.PingStats, contact *contact.Service, estimation *estimatedpayouts.Service,
 		walletFeatures operator.WalletFeatures, quicStats *contact.QUICStats,
-		spaceReport monitor.SpaceReport, server *server.Server, config operator.Config) (*Service, error) {
+		spaceReport monitor.SpaceReport, hashStore *piecestore.HashStoreBackend,
+		server *server.Server, config operator.Config) (*Service, error) {
 
 		_, port, _ := net.SplitHostPort(server.Addr().String())
 		return NewService(log, bandwidth, version,
@@ -39,7 +41,7 @@ func Module(ball *mud.Ball) {
 			reputationDB, storageUsageDB, pricingDB, satelliteDB,
 			pingStats, contact, estimation,
 			config.WalletFeatures, port, quicStats,
-			spaceReport)
+			spaceReport, hashStore)
 	})
 	mud.View[operator.Config, operator.WalletFeatures](ball, func(config operator.Config) operator.WalletFeatures {
 		return config.WalletFeatures

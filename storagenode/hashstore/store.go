@@ -61,12 +61,19 @@ type Store struct {
 	maxHint atomic.Uint64 // maximum hint id
 
 	stats struct { // contains statistics for monitoring the store
-		compactions atomic.Uint64 // bumped every time a compaction call finishes
-		lastCompact atomic.Uint32 // date of the last compaction
+		compactions        atomic.Uint64 // bumped every time a compaction call finishes
+		compactionFailures atomic.Uint64 // bumped every time a compaction call finishes with an error
+		lastCompact        atomic.Uint32 // date of the last compaction
 
 		logsRewritten atomic.Uint64 // bumped when a log file is marked to be rewritten
 		dataRewritten atomic.Uint64 // bumped whenever a record is rewritten with the length of the record
 		dataReclaimed atomic.Uint64 // bumped whenever a log is unlinked with the length of the log
+
+		salvageRounds       atomic.Uint64 // bumped after a salvage round is committed
+		salvageLostPieces   atomic.Uint64 // bumped for every record omitted by a committed salvage round
+		salvageLostBytes    atomic.Uint64 // bumped by the size of records omitted by committed salvage rounds
+		salvageAffectedLogs atomic.Uint64 // bumped by the number of logs affected by committed salvage rounds
+		salvageAborted      atomic.Uint64 // bumped when an uncommitted salvage round ends with an error
 
 		cached           atomic.Pointer[StoreStats] // set during compaction to maintain consistency of Stats calls
 		startTime        atomic.Value               // time of the start of the current compaction
@@ -483,15 +490,17 @@ type StoreStats struct {
 	TrashPercent float64 // percent of bytes that are trash in the log files.
 	TTLPercent   float64 // percent of bytes that have expiration but not trash in the log files.
 
-	Compacting      bool        // if true, a compaction is in progress.
-	Compactions     uint64      // number of compaction calls that finished
-	Today           uint32      // the current date.
-	LastCompact     uint32      // the date of the last compaction.
-	LogsRewritten   uint64      // number of log files attempted to be rewritten.
-	DataRewritten   memory.Size // number of bytes rewritten in the log files.
-	DataReclaimed   memory.Size // number of bytes reclaimed in the log files.
-	DataReclaimable memory.Size // number of bytes potentially reclaimable in the log files.
-	Table           TblStats    // stats about the hash table.
+	Compacting         bool        // if true, a compaction is in progress.
+	Compactions        uint64      // number of compaction calls that finished.
+	CompactionFailures uint64      // number of compaction calls that finished with an error.
+	Today              uint32      // the current date.
+	LastCompact        uint32      // the date of the last compaction.
+	LogsRewritten      uint64      // number of log files attempted to be rewritten.
+	DataRewritten      memory.Size // number of bytes rewritten in the log files.
+	DataReclaimed      memory.Size // number of bytes reclaimed in the log files.
+	DataReclaimable    memory.Size // number of bytes potentially reclaimable in the log files.
+	Table              TblStats    // stats about the hash table.
+	Salvage            SalvageStats
 
 	LogsSkipped    int // number of log files skipped due to hint exclusion
 	LogsMatched    int // number of log files checked and matched
@@ -529,6 +538,9 @@ func (s *Store) Stats() StoreStats {
 		stats.LogsRewritten = s.stats.logsRewritten.Load()
 		stats.DataRewritten = memory.Size(s.stats.dataRewritten.Load())
 		stats.DataReclaimed = memory.Size(s.stats.dataReclaimed.Load())
+		stats.Compactions = s.stats.compactions.Load()
+		stats.CompactionFailures = s.stats.compactionFailures.Load()
+		stats.Salvage = s.salvageStats()
 
 		return stats
 	}
@@ -572,16 +584,18 @@ func (s *Store) Stats() StoreStats {
 		TrashPercent: safeDivide(float64(stats.LenTrash), float64(lenLogs)),
 		TTLPercent:   safeDivide(float64(stats.LenTTL), float64(lenLogs)),
 
-		Compacting:      false,
-		Compactions:     s.stats.compactions.Load(),
-		Today:           s.today(),
-		LastCompact:     s.stats.lastCompact.Load(),
-		LogsRewritten:   s.stats.logsRewritten.Load(),
-		DataRewritten:   memory.Size(s.stats.dataRewritten.Load()),
-		DataReclaimed:   memory.Size(s.stats.dataReclaimed.Load()),
-		DataReclaimable: memory.Size(lenLogs) - stats.LenSet,
-		FreeRequired:    memory.Size(2+s.cfg.Compaction.RewriteMultiple) * stats.TableSize,
-		Table:           stats,
+		Compacting:         false,
+		Compactions:        s.stats.compactions.Load(),
+		CompactionFailures: s.stats.compactionFailures.Load(),
+		Today:              s.today(),
+		LastCompact:        s.stats.lastCompact.Load(),
+		LogsRewritten:      s.stats.logsRewritten.Load(),
+		DataRewritten:      memory.Size(s.stats.dataRewritten.Load()),
+		DataReclaimed:      memory.Size(s.stats.dataReclaimed.Load()),
+		DataReclaimable:    memory.Size(lenLogs) - stats.LenSet,
+		FreeRequired:       memory.Size(2+s.cfg.Compaction.RewriteMultiple) * stats.TableSize,
+		Table:              stats,
+		Salvage:            s.salvageStats(),
 
 		LogsSkipped:    s.stats.logsSkipped,
 		LogsMatched:    s.stats.logsMatched,
@@ -841,7 +855,12 @@ type CompactArguments struct {
 // dead data.
 func (s *Store) Compact(ctx context.Context, args CompactArguments) (err error) {
 	defer mon.Task()(&ctx)(&err)
-	defer s.stats.compactions.Add(1) // increase the number of compactions that have finished
+	defer func() {
+		s.stats.compactions.Add(1)
+		if err != nil {
+			s.stats.compactionFailures.Add(1)
+		}
+	}()
 
 	var compactionRounds int
 
@@ -1003,7 +1022,7 @@ func (s *Store) compactOnce(
 		salvage = salvageBudget.newRound()
 		defer func() {
 			if err != nil {
-				salvage.markAborted()
+				s.markSalvageAborted(salvage)
 			}
 		}()
 	}
