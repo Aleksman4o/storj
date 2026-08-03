@@ -70,6 +70,7 @@ func NewServer(logger *zap.Logger, assets fs.FS, notifications *notifications.Se
 	storageNodeRouter := router.PathPrefix("/api/sno").Subrouter()
 	storageNodeRouter.StrictSlash(true)
 	storageNodeRouter.HandleFunc("/", storageNodeController.StorageNode).Methods(http.MethodGet)
+	storageNodeRouter.HandleFunc("/compaction", storageNodeController.Compaction).Methods(http.MethodGet)
 	storageNodeRouter.HandleFunc("/satellites", storageNodeController.Satellites).Methods(http.MethodGet)
 	storageNodeRouter.HandleFunc("/satellite/{id}", storageNodeController.Satellite).Methods(http.MethodGet)
 	storageNodeRouter.HandleFunc("/satellites/{id}/pricing", storageNodeController.Pricing).Methods(http.MethodGet)
