@@ -1974,7 +1974,8 @@ func TestStore_AmnestyForUnlinkedLogFile(t *testing.T) {
 	cfg.Compaction.MaxLogSize = 4096
 
 	var amnestied []Key
-	s := newTestStore(t, cfg, WithAmnesty(func(ctx context.Context, keys []Key) {
+	s := newTestStore(t, cfg, WithAmnesty(func(ctx context.Context, keys []Key, reason AmnestyReason) {
+		assert.Equal(t, reason, AmnestyReasonHashMismatch)
 		amnestied = append(amnestied, keys...)
 	}))
 	defer s.Close()
@@ -2077,6 +2078,7 @@ func TestStore_CompactDropsTruncatedRecord(t *testing.T) {
 		for _, ordered := range []bool{true, false} {
 			t.Run(fmt.Sprintf("ordered=%v", ordered), func(t *testing.T) {
 				cfg.Compaction.OrderedRewrite = ordered
+				cfg.Compaction.Salvage = true
 				testStore_CompactDropsTruncatedRecord(t, cfg)
 			})
 		}
@@ -2084,7 +2086,8 @@ func TestStore_CompactDropsTruncatedRecord(t *testing.T) {
 }
 func testStore_CompactDropsTruncatedRecord(t *testing.T, cfg Config) {
 	var amnestied []Key
-	s := newTestStore(t, cfg, WithAmnesty(func(ctx context.Context, keys []Key) {
+	s := newTestStore(t, cfg, WithAmnesty(func(ctx context.Context, keys []Key, reason AmnestyReason) {
+		assert.Equal(t, reason, AmnestyReasonReadFailure)
 		amnestied = append(amnestied, keys...)
 	}))
 	defer s.Close()
