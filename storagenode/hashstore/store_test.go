@@ -1896,7 +1896,8 @@ func TestStore_AmnestyForUnlinkedLogFile(t *testing.T) {
 	cfg.Compaction.MaxLogSize = 4096
 
 	var amnestied []Key
-	s := newTestStore(t, cfg, WithAmnesty(func(ctx context.Context, keys []Key) {
+	s := newTestStore(t, cfg, WithAmnesty(func(ctx context.Context, keys []Key, reason AmnestyReason) {
+		assert.Equal(t, reason, AmnestyReasonHashMismatch)
 		amnestied = append(amnestied, keys...)
 	}))
 	defer s.Close()

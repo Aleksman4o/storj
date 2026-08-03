@@ -32,6 +32,19 @@ type compactState struct {
 	done   drpcsignal.Signal // set when compaction is done
 }
 
+// AmnestyReason identifies why a key is being reported to the amnesty service.
+type AmnestyReason byte
+
+const (
+	// AmnestyReasonHashMismatch reports a key whose stored data failed validation.
+	AmnestyReasonHashMismatch AmnestyReason = iota + 1
+	// AmnestyReasonReadFailure reports a key that compaction proved it could not read.
+	AmnestyReasonReadFailure
+)
+
+// AmnestyCallback reports keys that the store can no longer serve.
+type AmnestyCallback func(context.Context, []Key, AmnestyReason)
+
 // DB is a database that stores pieces.
 type DB struct {
 	logsPath  string // directory for log files (binary).
@@ -62,8 +75,8 @@ type Callbacks struct {
 	// return true if the record data is valid for filesystem checks
 	Valid func(Key, []byte) bool
 
-	// called with keys that were found to be invalid during checks
-	Amnesty func(context.Context, []Key)
+	// called with keys that the store can no longer serve and the reason why
+	Amnesty AmnestyCallback
 }
 
 // New makes or opens an existing database in the directory allowing for nlogs concurrent writes.

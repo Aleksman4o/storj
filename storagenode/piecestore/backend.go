@@ -251,7 +251,7 @@ func (hsb *HashStoreBackend) getDB(ctx context.Context, satellite storj.NodeID) 
 	var (
 		shouldTrash   func(ctx context.Context, pieceID storj.PieceID, created time.Time) bool
 		lastRestore   func(ctx context.Context) time.Time
-		amnestyReport func(context.Context, []storj.PieceID)
+		amnestyReport hashstore.AmnestyCallback
 	)
 	if hsb.bfm != nil {
 		shouldTrash = hsb.bfm.GetBloomFilter(satellite)
@@ -262,10 +262,24 @@ func (hsb *HashStoreBackend) getDB(ctx context.Context, satellite storj.NodeID) 
 		}
 	}
 	if hsb.amnesty != nil {
-		amnestyReport = func(ctx context.Context, pieceIDs []storj.PieceID) {
+		amnestyReport = func(ctx context.Context, pieceIDs []storj.PieceID, reason hashstore.AmnestyReason) {
+			var lostPieceReason pb.LostPieceReason
+			switch reason {
+			case hashstore.AmnestyReasonHashMismatch:
+				lostPieceReason = pb.LostPieceReason_HASH_MISMATCH
+			case hashstore.AmnestyReasonReadFailure:
+				lostPieceReason = pb.LostPieceReason_READ_FAILURE
+			default:
+				log.Error("refusing to report bad pieces with unknown amnesty reason",
+					zap.Uint8("reason", uint8(reason)),
+				)
+				return
+			}
+
 			for _, pieceID := range pieceIDs {
-				if err := hsb.amnesty.ReportBadPiece(ctx, satellite, pieceID); err != nil {
+				if err := hsb.amnesty.ReportBadPieceWithReason(ctx, satellite, pieceID, lostPieceReason); err != nil {
 					log.Error("failed to report bad piece to amnesty",
+						zap.Stringer("reason", lostPieceReason),
 						zap.Stringer("piece_id", pieceID),
 						zap.Error(err),
 					)
