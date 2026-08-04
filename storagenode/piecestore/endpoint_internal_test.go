@@ -7,7 +7,38 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"storj.io/common/memory"
 )
+
+func TestReportedFreeDisk(t *testing.T) {
+	tests := []struct {
+		name      string
+		target    memory.Size
+		available memory.Size
+		expected  memory.Size
+		notify    bool
+	}{
+		{name: "disabled", available: 20 * memory.GB, expected: 20 * memory.GB},
+		{name: "target below report threshold", target: 3 * memory.GB, available: 20 * memory.GB, expected: 20 * memory.GB},
+		{name: "target at report threshold", target: 5 * memory.GB, available: 20 * memory.GB, expected: 20 * memory.GB},
+		{name: "above target", target: 20 * memory.GB, available: 100 * memory.GB, expected: 85 * memory.GB},
+		{name: "at target", target: 20 * memory.GB, available: 20 * memory.GB, expected: 5 * memory.GB},
+		{name: "below target", target: 20 * memory.GB, available: 20*memory.GB - 1, expected: 5*memory.GB - 1, notify: true},
+		{name: "clamped at zero", target: 20 * memory.GB, available: 10 * memory.GB, expected: 0, notify: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			config := Config{
+				ReportCapacityThreshold: 5 * memory.GB,
+				TargetFreeSpace:         test.target,
+			}
+			require.Equal(t, test.expected.Int64(), config.reportedFreeDisk(test.available.Int64()))
+			require.Equal(t, test.notify, config.shouldNotifyLowDisk(test.available.Int64()))
+		})
+	}
+}
 
 func TestIsCongested(t *testing.T) {
 	const congestionThreshold = 0.8

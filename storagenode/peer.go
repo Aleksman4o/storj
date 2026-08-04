@@ -666,6 +666,7 @@ func New(log *zap.Logger, full *identity.FullIdentity, db DB, revocationDB exten
 			peer.Contact.Service,
 			peer.Storage2.SpaceReport,
 			config.Storage2.Monitor,
+			config.Storage2.ReportedFreeDiskAdjustment(),
 			config.Contact.CheckInTimeout,
 		)
 		peer.Services.Add(lifecycle.Item{

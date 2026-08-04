@@ -316,8 +316,8 @@ func Module(ball *mud.Ball) {
 		config.RegisterConfig[monitor.Config](ball, "monitor")
 
 		mud.RegisterInterfaceImplementation[monitor.DiskVerification, *pieces.Store](ball)
-		mud.Provide[*monitor.Service](ball, func(log *zap.Logger, verifier monitor.DiskVerification, contactService *contact.Service, report monitor.SpaceReport, config monitor.Config, contactConfig contact.Config) *monitor.Service {
-			return monitor.NewService(log, verifier, contactService, report, config, contactConfig.CheckInTimeout)
+		mud.Provide[*monitor.Service](ball, func(log *zap.Logger, verifier monitor.DiskVerification, contactService *contact.Service, report monitor.SpaceReport, config monitor.Config, storage2Config piecestore.Config, contactConfig contact.Config) *monitor.Service {
+			return monitor.NewService(log, verifier, contactService, report, config, storage2Config.ReportedFreeDiskAdjustment(), contactConfig.CheckInTimeout)
 		})
 
 		mud.Provide[*retain.Service](ball, retain.NewService)
