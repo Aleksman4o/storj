@@ -1196,6 +1196,64 @@ func testStore_StatsWhileCompacting(t *testing.T, cfg Config) {
 	assert.NoError(t, <-errCh)
 }
 
+func TestStore_StatsWithZeroWriteTime(t *testing.T) {
+	forAllTables(t, func(t *testing.T, cfg Config) {
+		s := newTestStore(t, cfg)
+		defer s.Close()
+
+		cached := s.Stats()
+		s.stats.startTime.Store(time.Now())
+		s.stats.writeTime.Store(time.Time{})
+		s.stats.totalRecords.Store(10)
+		s.stats.processedRecords.Store(2)
+		s.stats.cached.Store(&cached)
+		defer s.stats.cached.Store(nil)
+
+		stats := s.Stats()
+		assert.That(t, stats.Compacting)
+		assert.Equal(t, stats.Compaction.Remaining, 0.0)
+	})
+}
+
+func TestStore_StatsDuringOrderedRewrite(t *testing.T) {
+	forAllTables(t, func(t *testing.T, cfg Config) {
+		cfg.Compaction.OrderedRewrite = true
+
+		s := newTestStore(t, cfg)
+		defer s.Close()
+
+		s.AssertCreate(WithDataSize(512))
+		s.AssertCreate(WithDataSize(512))
+		dead := s.AssertCreate(WithDataSize(4096))
+
+		s.AssertCompact(WithShouldTrash(func(ctx context.Context, key Key, created time.Time) bool {
+			return key == dead
+		}))
+		s.today += uint32(s.cfg.Compaction.ExpiresDays) + 1
+
+		var rewriteStats StoreStats
+		var rewriteStart time.Time
+		captured := false
+		s.fakes.compactionCopy = func(dst io.Writer, src io.Reader, length int64) (int64, error) {
+			if !captured {
+				rewriteStart = s.stats.writeTime.Load().(time.Time)
+				rewriteStats = s.Stats()
+				captured = true
+			}
+			return io.CopyN(dst, src, length)
+		}
+
+		assert.NoError(t, s.Compact(t.Context(), CompactArguments{}))
+		assert.That(t, captured)
+		assert.That(t, rewriteStats.Compacting)
+		assert.Equal(t, rewriteStats.Compaction.ProcessedRecords, uint64(1))
+		assert.Equal(t, rewriteStats.Compaction.TotalRecords, uint64(2))
+		assert.That(t, !rewriteStart.IsZero())
+		assert.That(t, rewriteStats.Compaction.Remaining >= 0)
+		assert.That(t, rewriteStats.Compaction.Remaining < time.Hour.Seconds())
+	})
+}
+
 func TestStore_CompactionRewritesLogsWhenNothingToDo(t *testing.T) {
 	forAllTables(t, testStore_CompactionRewritesLogsWhenNothingToDo)
 }

@@ -527,7 +527,10 @@ func (s *Store) Stats() StoreStats {
 		processed := s.stats.processedRecords.Load()
 
 		elapsed := time.Since(start).Seconds()
-		remaining := time.Since(write).Seconds() * safeDivide(float64(total-processed), float64(processed))
+		remaining := float64(0)
+		if !write.IsZero() && processed > 0 && processed < total {
+			remaining = time.Since(write).Seconds() * float64(total-processed) / float64(processed)
+		}
 
 		stats.Compacting = true
 		stats.Compaction.Elapsed = elapsed
@@ -1279,6 +1282,7 @@ func (s *Store) compactOnce(
 		ri.sortByLogOff()
 
 		// update the total number of records expected to be rewritten in this compaction.
+		s.stats.writeTime.Store(time.Now())
 		s.stats.totalRecords.Store(uint64(len(ri.records)))
 		s.stats.processedRecords.Store(0)
 
