@@ -178,7 +178,7 @@ func createEndpoint(ctx context.Context, satIdent, snIdent *identity.FullIdentit
 		spaceReport = try.E1(monitor.NewSharedDisk(ctx, log, storagenode.NewPieceStoreSpaceUsageAdapter(piecesStore), hsb, cfg.Storage2.Monitor.MinimumDiskSpace.Int64(), 1<<40))
 	}
 
-	monitorService := monitor.NewService(log, piecesStore, contactService, spaceReport, cfg.Storage2.Monitor, cfg.Contact.CheckInTimeout)
+	monitorService := monitor.NewService(log, piecesStore, contactService, spaceReport, cfg.Storage2.Monitor, cfg.Storage2.ReportedFreeDiskAdjustment(), cfg.Contact.CheckInTimeout)
 
 	opb := piecestore.NewOldPieceBackend(piecesStore, trashChore, monitorService)
 
