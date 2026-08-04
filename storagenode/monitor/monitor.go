@@ -83,31 +83,33 @@ type DiskVerification interface {
 //
 // architecture: Service
 type Service struct {
-	log                   *zap.Logger
-	contact               *contact.Service
-	cooldown              *sync2.Cooldown
-	Loop                  *sync2.Cycle
-	VerifyDirReadableLoop *sync2.Cycle
-	VerifyDirWritableLoop *sync2.Cycle
-	Config                Config
-	spaceReport           SpaceReport
-	verifier              DiskVerification
-	checkInTimeout        time.Duration
+	log                        *zap.Logger
+	contact                    *contact.Service
+	cooldown                   *sync2.Cooldown
+	Loop                       *sync2.Cycle
+	VerifyDirReadableLoop      *sync2.Cycle
+	VerifyDirWritableLoop      *sync2.Cycle
+	Config                     Config
+	reportedFreeDiskAdjustment int64
+	spaceReport                SpaceReport
+	verifier                   DiskVerification
+	checkInTimeout             time.Duration
 }
 
 // NewService creates a new storage node monitoring service.
-func NewService(log *zap.Logger, verifier DiskVerification, contact *contact.Service, spaceReport SpaceReport, config Config, checkInTimeout time.Duration) *Service {
+func NewService(log *zap.Logger, verifier DiskVerification, contact *contact.Service, spaceReport SpaceReport, config Config, reportedFreeDiskAdjustment int64, checkInTimeout time.Duration) *Service {
 	return &Service{
-		log:                   log,
-		contact:               contact,
-		cooldown:              sync2.NewCooldown(config.NotifyLowDiskCooldown),
-		Loop:                  sync2.NewCycle(config.Interval),
-		VerifyDirReadableLoop: sync2.NewCycle(config.VerifyDirReadableInterval),
-		VerifyDirWritableLoop: sync2.NewCycle(config.VerifyDirWritableInterval),
-		Config:                config,
-		verifier:              verifier,
-		spaceReport:           spaceReport,
-		checkInTimeout:        checkInTimeout,
+		log:                        log,
+		contact:                    contact,
+		cooldown:                   sync2.NewCooldown(config.NotifyLowDiskCooldown),
+		Loop:                       sync2.NewCycle(config.Interval),
+		VerifyDirReadableLoop:      sync2.NewCycle(config.VerifyDirReadableInterval),
+		VerifyDirWritableLoop:      sync2.NewCycle(config.VerifyDirWritableInterval),
+		Config:                     config,
+		reportedFreeDiskAdjustment: max(reportedFreeDiskAdjustment, 0),
+		verifier:                   verifier,
+		spaceReport:                spaceReport,
+		checkInTimeout:             checkInTimeout,
 	}
 }
 
@@ -225,10 +227,19 @@ func (service *Service) updateNodeInformation(ctx context.Context) (err error) {
 	}
 
 	service.contact.UpdateSelf(&pb.NodeCapacity{
-		FreeDisk: spaceReport.Available,
+		FreeDisk: advertisedFreeDisk(spaceReport.Available, service.reportedFreeDiskAdjustment),
 	})
 
 	return nil
+}
+
+func advertisedFreeDisk(available, adjustment int64) int64 {
+	available = max(available, 0)
+	adjustment = max(adjustment, 0)
+	if available <= adjustment {
+		return 0
+	}
+	return available - adjustment
 }
 
 // AvailableSpace returns available disk space for upload.

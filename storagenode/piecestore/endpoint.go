@@ -94,6 +94,7 @@ type Config struct {
 	PieceScanOnStartup      bool          `help:"if set to true, all pieces disk usage is recalculated on startup" default:"true"`
 	StreamOperationTimeout  time.Duration `help:"how long to spend waiting for a stream operation before canceling" default:"30m"`
 	ReportCapacityThreshold memory.Size   `help:"threshold below which to immediately notify satellite of capacity" default:"5GB" hidden:"true"`
+	TargetFreeSpace         memory.Size   `user:"true" help:"target amount of locally available disk space around which the node should stop being selected for uploads; only adjusts capacity reported to satellites and does not reject uploads" default:"0B"`
 	MaxUsedSerialsSize      memory.Size   `help:"amount of memory allowed for used serials store - once surpassed, serials will be dropped at random" default:"1MB"`
 
 	MinUploadSpeed                    memory.Size   `help:"a client upload speed should not be lower than MinUploadSpeed in bytes-per-second (E.g: 1Mb), otherwise, it will be flagged as slow-connection and potentially be closed" default:"0Mb"`
@@ -109,6 +110,32 @@ type Config struct {
 	DeleteQueueSize    int           `help:"size of the piece delete queue (unused)" default:"10000" hidden:"true" deprecated:"true"`
 	ExistsCheckWorkers int           `help:"how many workers to use to check if satellite pieces exists (unused)" default:"5" hidden:"true" deprecated:"true"`
 	RetainTimeBuffer   time.Duration `help:"allows for small differences in the satellite and storagenode clocks" default:"48h0m0s" hidden:"true" deprecated:"true"`
+}
+
+// ReportedFreeDiskAdjustment returns how much local capacity should be withheld from capacity
+// reports. ReportCapacityThreshold is already maintained as a buffer by the satellite, so only the
+// part of TargetFreeSpace above that threshold needs to be withheld.
+func (config Config) ReportedFreeDiskAdjustment() int64 {
+	target := max(config.TargetFreeSpace.Int64(), 0)
+	reportThreshold := max(config.ReportCapacityThreshold.Int64(), 0)
+	if target <= reportThreshold {
+		return 0
+	}
+	return target - reportThreshold
+}
+
+func (config Config) reportedFreeDisk(available int64) int64 {
+	available = max(available, 0)
+	adjustment := config.ReportedFreeDiskAdjustment()
+	if available <= adjustment {
+		return 0
+	}
+	return available - adjustment
+}
+
+func (config Config) shouldNotifyLowDisk(available int64) bool {
+	reportThreshold := max(config.ReportCapacityThreshold.Int64(), 0)
+	return config.reportedFreeDisk(available) < reportThreshold
 }
 
 // PingStatsSource stores the last time when the target was pinged.
@@ -291,9 +318,11 @@ func (endpoint *Endpoint) Upload(stream pb.DRPCPiecestore_UploadStream) (err err
 		endpoint.log.Error("upload internal error", zap.Error(err))
 		return rpcstatus.NamedWrap("available-space-failure", rpcstatus.Internal, err)
 	}
-	// if availableSpace has fallen below ReportCapacityThreshold, report capacity to satellites
+	// If advertised available space has fallen below ReportCapacityThreshold, report capacity to
+	// satellites. The advertised value may be lower than local availability when target free space
+	// is configured.
 	defer func() {
-		if availableSpace < endpoint.config.ReportCapacityThreshold.Int64() {
+		if endpoint.config.shouldNotifyLowDisk(availableSpace) {
 			endpoint.monitor.NotifyLowDisk()
 		}
 	}()
