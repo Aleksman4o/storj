@@ -11,9 +11,10 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// IsSalvageableReadError reports whether err unambiguously describes a local
-// failure to read data from a file. Callers must still verify that writes to
-// the same storage are healthy before discarding data.
+// IsSalvageableReadError reports whether err is eligible for classification as
+// a local file read failure. Callers must still confirm the error with a direct
+// retry and verify that writes to the same storage are healthy before discarding
+// data.
 func IsSalvageableReadError(err error) bool {
 	return errors.Is(err, windows.ERROR_CRC) ||
 		errors.Is(err, windows.ERROR_SECTOR_NOT_FOUND) ||

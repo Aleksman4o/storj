@@ -161,8 +161,15 @@ func TestStore_CompactionSalvagesSourceReadFailure(t *testing.T) {
 		}
 		return io.CopyN(dst, src, length)
 	}
+	checkedReads := 0
 	s.fakes.compactionReadAt = func(src io.ReaderAt, p []byte, offset int64) (int, error) {
-		return 0, sourceErr
+		checkedReads++
+		return 1, sourceErr
+	}
+	checkedWrites := 0
+	s.fakes.compactionWrite = func(dst io.Writer, p []byte) (int, error) {
+		checkedWrites++
+		return dst.Write(p)
 	}
 	s.fakes.salvageableReadErr = func(err error) bool {
 		return errors.Is(err, sourceErr)
@@ -173,6 +180,57 @@ func TestStore_CompactionSalvagesSourceReadFailure(t *testing.T) {
 	s.AssertNotExist(lost)
 	s.AssertRead(good, WithDataSize(512))
 	assert.DeepEqual(t, amnestied, []Key{lost})
+	assert.Equal(t, checkedReads, 2)
+	assert.Equal(t, checkedWrites, 0)
+}
+
+func TestStore_CompactionRetriesTransientSourceReadFailure(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Compaction.Salvage = true
+
+	var amnestied []Key
+	s := newTestStore(t, cfg, WithAmnesty(func(ctx context.Context, keys []Key, reason AmnestyReason) {
+		assert.Equal(t, reason, AmnestyReasonReadFailure)
+		amnestied = append(amnestied, keys...)
+	}))
+	defer s.Close()
+
+	first := s.AssertCreate(WithDataSize(512))
+	second := s.AssertCreate(WithDataSize(512))
+	dead := s.AssertCreate(WithDataSize(2048))
+
+	s.AssertCompact(WithShouldTrash(func(ctx context.Context, key Key, created time.Time) bool {
+		return key == dead
+	}))
+	s.today += uint32(s.cfg.Compaction.ExpiresDays) + 1
+
+	sourceErr := errors.New("injected transient source read failure")
+	fastCopies := 0
+	s.fakes.compactionCopy = func(dst io.Writer, src io.Reader, length int64) (int64, error) {
+		fastCopies++
+		if fastCopies == 1 {
+			return 0, sourceErr
+		}
+		return io.CopyN(dst, src, length)
+	}
+	checkedReads := 0
+	s.fakes.compactionReadAt = func(src io.ReaderAt, p []byte, offset int64) (int, error) {
+		checkedReads++
+		if checkedReads == 1 {
+			return 0, sourceErr
+		}
+		return src.ReadAt(p, offset)
+	}
+	s.fakes.salvageableReadErr = func(err error) bool {
+		return errors.Is(err, sourceErr)
+	}
+
+	assert.NoError(t, s.Compact(t.Context(), CompactArguments{}))
+
+	assert.Equal(t, checkedReads, 2)
+	assert.Equal(t, len(amnestied), 0)
+	s.AssertRead(first, WithDataSize(512))
+	s.AssertRead(second, WithDataSize(512))
 }
 
 func TestStore_CompactionSalvagesMultipleTruncatedLogs(t *testing.T) {
@@ -352,6 +410,24 @@ func TestStore_CompactionSalvageFailsClosed(t *testing.T) {
 			install: func(s *Store, injected error) {
 				s.fakes.compactionReadAt = func(io.ReaderAt, []byte, int64) (int, error) {
 					return 0, injected
+				}
+			},
+			message: "reading compaction source during checked copy",
+		},
+		{
+			name: "source read retry returns unknown error",
+			install: func(s *Store, injected error) {
+				retryable := errors.New("injected retryable source read failure")
+				reads := 0
+				s.fakes.compactionReadAt = func(io.ReaderAt, []byte, int64) (int, error) {
+					reads++
+					if reads == 1 {
+						return 0, retryable
+					}
+					return 0, injected
+				}
+				s.fakes.salvageableReadErr = func(err error) bool {
+					return errors.Is(err, retryable)
 				}
 			},
 			message: "reading compaction source during checked copy",

@@ -5,8 +5,8 @@
 
 package platform
 
-// IsSalvageableReadError reports whether err unambiguously describes a local
-// failure to read data from a file. Unknown platforms fail closed.
+// IsSalvageableReadError reports whether err is eligible for classification as
+// a local file read failure. Unknown platforms fail closed.
 func IsSalvageableReadError(error) bool {
 	return false
 }
