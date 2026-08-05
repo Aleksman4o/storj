@@ -292,7 +292,8 @@ func (s *Store) compactionSourceSize(fh *os.File) (uint64, error) {
 }
 
 // copyRecordChecked copies one record without copy_file_range so that read and write failures are
-// distinguishable. It returns at most one of readErr and writeErr.
+// distinguishable. A potentially salvageable source read failure is retried once before any data
+// from that block is written. It returns at most one of readErr and writeErr.
 func (s *Store) copyRecordChecked(
 	ctx context.Context,
 	dst *os.File,
@@ -313,13 +314,10 @@ func (s *Store) copyRecordChecked(
 			want = remaining
 		}
 
-		readAt := src.ReadAt
-		if s.fakes.compactionReadAt != nil {
-			readAt = func(p []byte, off int64) (int, error) {
-				return s.fakes.compactionReadAt(src, p, off)
-			}
+		n, err := s.readCompactionBlock(src, buf[:want], int64(offset))
+		if err != nil {
+			return err, nil
 		}
-		n, err := readAt(buf[:want], int64(offset))
 		if n > 0 {
 			write := dst.Write
 			if s.fakes.compactionWrite != nil {
@@ -337,14 +335,29 @@ func (s *Store) copyRecordChecked(
 			offset += uint64(n)
 			remaining -= uint64(n)
 		}
-		if err != nil {
-			return err, nil
-		}
 		if n == 0 {
 			return io.ErrNoProgress, nil
 		}
 	}
 	return nil, nil
+}
+
+// readCompactionBlock retries a potentially permanent source read failure once from the same
+// offset. The first result is discarded, including any partial data, so callers never write a
+// block until its retry has either succeeded or confirmed the failure.
+func (s *Store) readCompactionBlock(src *os.File, data []byte, offset int64) (int, error) {
+	readAt := src.ReadAt
+	if s.fakes.compactionReadAt != nil {
+		readAt = func(p []byte, off int64) (int, error) {
+			return s.fakes.compactionReadAt(src, p, off)
+		}
+	}
+
+	n, err := readAt(data, offset)
+	if err == nil || !s.salvageableSourceReadError(err) {
+		return n, err
+	}
+	return readAt(data, offset)
 }
 
 func writeFull(write func([]byte) (int, error), data []byte) (int, error) {
