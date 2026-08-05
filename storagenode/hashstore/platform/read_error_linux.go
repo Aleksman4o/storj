@@ -1,14 +1,13 @@
 // Copyright (C) 2026 Storj Labs, Inc.
 // See LICENSE for copying information.
 
-//go:build windows
+//go:build linux
 
 package platform
 
 import (
 	"errors"
-
-	"golang.org/x/sys/windows"
+	"syscall"
 )
 
 // IsSalvageableReadError reports whether err is eligible for classification as
@@ -16,7 +15,5 @@ import (
 // retry and verify that writes to the same storage are healthy before discarding
 // data.
 func IsSalvageableReadError(err error) bool {
-	return errors.Is(err, windows.ERROR_CRC) ||
-		errors.Is(err, windows.ERROR_SECTOR_NOT_FOUND) ||
-		errors.Is(err, windows.ERROR_READ_FAULT)
+	return errors.Is(err, syscall.EIO) || errors.Is(err, syscall.ENODATA)
 }
