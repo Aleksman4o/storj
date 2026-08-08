@@ -433,6 +433,11 @@ func New(log *zap.Logger, full *identity.FullIdentity, db DB, revocationDB exten
 		if err != nil {
 			return nil, errs.Combine(err, peer.Close())
 		}
+		// Refresh the trust pool immediately so satellites are available before
+		// other components (like HashStoreBackend) are initialized.
+		if err := peer.Storage2.Trust.Refresh(context.Background()); err != nil {
+			return nil, errs.Combine(err, peer.Close())
+		}
 		peer.Services.Add(lifecycle.Item{
 			Name: "trust",
 			Run:  peer.Storage2.Trust.Run,
@@ -1112,12 +1117,6 @@ func New(log *zap.Logger, full *identity.FullIdentity, db DB, revocationDB exten
 // Run runs storage node until it's either closed or it errors.
 func (peer *Peer) Run(ctx context.Context) (err error) {
 	defer mon.Task()(&ctx)(&err)
-
-	// Refresh the trust pool first. It will be updated periodically via
-	// Run() below.
-	if err := peer.Storage2.Trust.Refresh(ctx); err != nil {
-		return err
-	}
 
 	if err := peer.Preflight.LocalTime.Check(ctx); err != nil {
 		peer.Log.Error("Failed preflight check.", zap.Error(err))
