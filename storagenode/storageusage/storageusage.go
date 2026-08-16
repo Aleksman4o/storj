@@ -16,15 +16,17 @@ import (
 type DB interface {
 	// Store stores storage usage stamps to db replacing conflicting entries
 	Store(ctx context.Context, stamps []Stamp) error
-	// GetDaily returns daily storage usage stamps for particular satellite
-	// for provided time range
+	// GetDaily returns non-normalized daily storage usage stamps for a particular
+	// satellite and time range. Display callers should use
+	// GetDailyRawForNormalization together with NormalizeForDisplay.
 	GetDaily(ctx context.Context, satelliteID storj.NodeID, from, to time.Time) ([]Stamp, error)
 	// GetDailyRawForNormalization returns unmodified satellite storage usage
 	// stamps for a particular satellite and time range, together with the two
 	// preceding stamps required to normalize the first available rate.
 	GetDailyRawForNormalization(ctx context.Context, satelliteID storj.NodeID, from, to time.Time) ([]Stamp, error)
-	// GetDailyTotal returns daily storage usage stamps summed across all known satellites
-	// for provided time range
+	// GetDailyTotal returns non-normalized daily storage usage stamps summed across
+	// all known satellites for a provided time range. Display callers should
+	// normalize each satellite separately before combining the results.
 	GetDailyTotal(ctx context.Context, from, to time.Time) ([]StampGroup, error)
 	// Summary returns aggregated storage usage across all satellites.
 	Summary(ctx context.Context, from, to time.Time) (float64, float64, error)
