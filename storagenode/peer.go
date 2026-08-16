@@ -1061,6 +1061,7 @@ func New(log *zap.Logger, full *identity.FullIdentity, db DB, revocationDB exten
 			apiKeys,
 			peer.Storage2.Monitor,
 			peer.DB.StorageUsage(),
+			peer.Storage2.Trust,
 		)
 
 		peer.Multinode.Bandwidth = multinode.NewBandwidthEndpoint(

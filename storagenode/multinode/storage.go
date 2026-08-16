@@ -5,6 +5,7 @@ package multinode
 
 import (
 	"context"
+	"time"
 
 	"github.com/zeebo/errs"
 	"go.uber.org/zap"
@@ -14,6 +15,7 @@ import (
 	"storj.io/storj/storagenode/apikeys"
 	"storj.io/storj/storagenode/monitor"
 	"storj.io/storj/storagenode/storageusage"
+	"storj.io/storj/storagenode/trust"
 )
 
 var _ multinodepb.DRPCStorageServer = (*StorageEndpoint)(nil)
@@ -28,15 +30,17 @@ type StorageEndpoint struct {
 	apiKeys *apikeys.Service
 	monitor *monitor.Service
 	usage   storageusage.DB
+	trust   trust.TrustedSatelliteSource
 }
 
 // NewStorageEndpoint creates new multinode storage endpoint.
-func NewStorageEndpoint(log *zap.Logger, apiKeys *apikeys.Service, monitor *monitor.Service, usage storageusage.DB) *StorageEndpoint {
+func NewStorageEndpoint(log *zap.Logger, apiKeys *apikeys.Service, monitor *monitor.Service, usage storageusage.DB, trust trust.TrustedSatelliteSource) *StorageEndpoint {
 	return &StorageEndpoint{
 		log:     log,
 		apiKeys: apiKeys,
 		monitor: monitor,
 		usage:   usage,
+		trust:   trust,
 	}
 }
 
@@ -83,14 +87,23 @@ func (storage *StorageEndpoint) Usage(ctx context.Context, req *multinodepb.Stor
 		return nil, rpcstatus.Wrap(rpcstatus.InvalidArgument, errs.New("to timestamp is not provided"))
 	}
 
-	stamps, err := storage.usage.GetDailyTotal(ctx, from, to)
+	through := displayThrough(to)
+	satellites := storage.trust.GetSatellites(ctx)
+	normalizedBySatellite := make([][]storageusage.Stamp, 0, len(satellites))
+	for _, satelliteID := range satellites {
+		rawStamps, err := storage.usage.GetDailyRawForNormalization(ctx, satelliteID, from, through)
+		if err != nil {
+			return nil, rpcstatus.Wrap(rpcstatus.Internal, err)
+		}
+		normalizedBySatellite = append(normalizedBySatellite, storageusage.NormalizeForDisplay(rawStamps, from, through))
+	}
+	stamps := storageusage.CombineForDisplay(normalizedBySatellite...)
+
+	summary, _, err := storage.usage.Summary(ctx, from, to)
 	if err != nil {
 		return nil, rpcstatus.Wrap(rpcstatus.Internal, err)
 	}
-	summary, averageUsageInBytes, err := storage.usage.Summary(ctx, from, to)
-	if err != nil {
-		return nil, rpcstatus.Wrap(rpcstatus.Internal, err)
-	}
+	averageUsageInBytes := storageusage.DisplayAverage(stamps)
 
 	var usage []*multinodepb.StorageUsage
 	for _, stamp := range stamps {
@@ -129,14 +142,18 @@ func (storage *StorageEndpoint) UsageSatellite(ctx context.Context, req *multino
 		return nil, rpcstatus.Wrap(rpcstatus.InvalidArgument, errs.New("to timestamp is not provided"))
 	}
 
-	stamps, err := storage.usage.GetDaily(ctx, req.SatelliteId, from, to)
+	through := displayThrough(to)
+	rawStamps, err := storage.usage.GetDailyRawForNormalization(ctx, req.SatelliteId, from, through)
 	if err != nil {
 		return nil, rpcstatus.Wrap(rpcstatus.Internal, err)
 	}
-	summary, averageUsageInBytes, err := storage.usage.SatelliteSummary(ctx, req.SatelliteId, from, to)
+	stamps := storageusage.NormalizeForDisplay(rawStamps, from, through)
+
+	summary, _, err := storage.usage.SatelliteSummary(ctx, req.SatelliteId, from, to)
 	if err != nil {
 		return nil, rpcstatus.Wrap(rpcstatus.Internal, err)
 	}
+	averageUsageInBytes := storageusage.DisplayAverage(stamps)
 
 	var usage []*multinodepb.StorageUsage
 	for _, stamp := range stamps {
@@ -152,4 +169,12 @@ func (storage *StorageEndpoint) UsageSatellite(ctx context.Context, req *multino
 		Summary:           summary,
 		AverageUsageBytes: averageUsageInBytes,
 	}, nil
+}
+
+func displayThrough(to time.Time) time.Time {
+	now := time.Now().UTC()
+	if to.Before(now) {
+		return to
+	}
+	return now
 }
