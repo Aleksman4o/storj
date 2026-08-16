@@ -46,8 +46,8 @@ func (db *storageUsageDB) Store(ctx context.Context, stamps []storageusage.Stamp
 	})
 }
 
-// GetDaily returns daily storage usage stamps for particular satellite
-// for provided time range.
+// GetDaily returns non-normalized daily storage usage stamps for a particular
+// satellite and time range.
 func (db *storageUsageDB) GetDaily(ctx context.Context, satelliteID storj.NodeID, from, to time.Time) (_ []storageusage.Stamp, err error) {
 	defer mon.Task()(&ctx)(&err)
 
@@ -151,8 +151,8 @@ func (db *storageUsageDB) GetDailyRawForNormalization(ctx context.Context, satel
 	return stamps, rows.Err()
 }
 
-// GetDailyTotal returns daily storage usage stamps summed across all known satellites
-// for provided time range.
+// GetDailyTotal returns non-normalized daily storage usage stamps summed across
+// all known satellites for a provided time range.
 func (db *storageUsageDB) GetDailyTotal(ctx context.Context, from, to time.Time) (_ []storageusage.StampGroup, err error) {
 	defer mon.Task()(&ctx)(&err)
 
