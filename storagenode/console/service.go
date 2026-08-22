@@ -14,7 +14,9 @@ import (
 	"storj.io/common/storj"
 	"storj.io/common/version"
 	"storj.io/storj/private/date"
+	"storj.io/storj/private/multinodeauth"
 	"storj.io/storj/private/version/checker"
+	"storj.io/storj/storagenode/apikeys"
 	"storj.io/storj/storagenode/bandwidth"
 	"storj.io/storj/storagenode/contact"
 	"storj.io/storj/storagenode/monitor"
@@ -49,6 +51,7 @@ type Service struct {
 	contact        *contact.Service
 	spaceReport    monitor.SpaceReport
 	hashStore      *piecestore.HashStoreBackend
+	apiKeys        *apikeys.Service
 
 	estimation *estimatedpayouts.Service
 	version    *checker.Service
@@ -69,7 +72,7 @@ func NewService(log *zap.Logger, bandwidth bandwidth.DB, version *checker.Servic
 	reputationDB reputation.DB, storageUsageDB storageusage.DB, pricingDB pricing.DB, satelliteDB satellites.DB,
 	pingStats *contact.PingStats, contact *contact.Service, estimation *estimatedpayouts.Service,
 	walletFeatures operator.WalletFeatures, port string, quicStats *contact.QUICStats,
-	spaceReport monitor.SpaceReport, hashStore *piecestore.HashStoreBackend) (*Service, error) {
+	spaceReport monitor.SpaceReport, hashStore *piecestore.HashStoreBackend, apiKeys *apikeys.Service) (*Service, error) {
 	if log == nil {
 		return nil, errs.New("log can't be nil")
 	}
@@ -97,6 +100,9 @@ func NewService(log *zap.Logger, bandwidth bandwidth.DB, version *checker.Servic
 	if hashStore == nil {
 		return nil, errs.New("hash store can't be nil")
 	}
+	if apiKeys == nil {
+		return nil, errs.New("api keys service can't be nil")
+	}
 
 	return &Service{
 		log:            log,
@@ -118,7 +124,17 @@ func NewService(log *zap.Logger, bandwidth bandwidth.DB, version *checker.Servic
 		configuredPort: port,
 		spaceReport:    spaceReport,
 		hashStore:      hashStore,
+		apiKeys:        apiKeys,
 	}, nil
+}
+
+// AuthenticateAPIKey checks a base64-encoded multinode API key.
+func (s *Service) AuthenticateAPIKey(ctx context.Context, encoded string) error {
+	secret, err := multinodeauth.SecretFromBase64(encoded)
+	if err != nil {
+		return err
+	}
+	return s.apiKeys.Check(ctx, secret)
 }
 
 // SatelliteInfo encapsulates satellite ID and disqualification.

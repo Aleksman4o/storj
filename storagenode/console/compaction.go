@@ -5,9 +5,11 @@ package console
 
 import (
 	"context"
+	"time"
 
 	"storj.io/common/storj"
 	"storj.io/storj/storagenode/hashstore"
+	"storj.io/storj/storagenode/piecestore"
 )
 
 // CompactionTotals contains compaction counters accumulated since the process started.
@@ -40,20 +42,42 @@ type CompactionProgress struct {
 type SatelliteCompaction struct {
 	SatelliteID      storj.NodeID        `json:"satelliteID"`
 	Compacting       bool                `json:"compacting"`
+	Mode             string              `json:"mode,omitempty"`
 	CurrentRound     *CompactionProgress `json:"currentRound,omitempty"`
 	ReclaimableBytes int64               `json:"reclaimableBytes"`
 	RuntimeTotals    CompactionTotals    `json:"runtimeTotals"`
 	Salvage          CompactionSalvage   `json:"salvage"`
 }
 
+// ManualCompactionResult contains one satellite result from a manual compaction job.
+type ManualCompactionResult struct {
+	SatelliteID storj.NodeID `json:"satelliteID"`
+	Status      string       `json:"status"`
+	Error       string       `json:"error,omitempty"`
+}
+
+// ManualCompactionJob contains the state of the latest node-level manual compaction job.
+type ManualCompactionJob struct {
+	ID                  uint64                   `json:"id"`
+	State               string                   `json:"state"`
+	StartedAt           *time.Time               `json:"startedAt,omitempty"`
+	FinishedAt          *time.Time               `json:"finishedAt,omitempty"`
+	CurrentSatellite    *storj.NodeID            `json:"currentSatellite,omitempty"`
+	TotalSatellites     int                      `json:"totalSatellites"`
+	ProcessedSatellites int                      `json:"processedSatellites"`
+	Results             []ManualCompactionResult `json:"results"`
+}
+
 // CompactionInfo contains current and runtime compaction statistics for the node.
 type CompactionInfo struct {
-	Compacting       bool                  `json:"compacting"`
-	SalvageEnabled   bool                  `json:"salvageEnabled"`
-	ReclaimableBytes int64                 `json:"reclaimableBytes"`
-	RuntimeTotals    CompactionTotals      `json:"runtimeTotals"`
-	Salvage          CompactionSalvage     `json:"salvage"`
-	Satellites       []SatelliteCompaction `json:"satellites"`
+	Compacting                 bool                  `json:"compacting"`
+	SalvageEnabled             bool                  `json:"salvageEnabled"`
+	ManualLogCompactionEnabled bool                  `json:"manualLogCompactionEnabled"`
+	ManualJob                  ManualCompactionJob   `json:"manualJob"`
+	ReclaimableBytes           int64                 `json:"reclaimableBytes"`
+	RuntimeTotals              CompactionTotals      `json:"runtimeTotals"`
+	Salvage                    CompactionSalvage     `json:"salvage"`
+	Satellites                 []SatelliteCompaction `json:"satellites"`
 }
 
 // GetCompactionData returns current and runtime compaction statistics.
@@ -62,9 +86,12 @@ func (s *Service) GetCompactionData(ctx context.Context) (_ *CompactionInfo, err
 
 	stats := s.hashStore.CompactionStats()
 	data := &CompactionInfo{
-		SalvageEnabled: s.hashStore.SalvageEnabled(),
-		Satellites:     make([]SatelliteCompaction, 0, len(stats)),
+		SalvageEnabled:             s.hashStore.SalvageEnabled(),
+		ManualLogCompactionEnabled: s.hashStore.ManualLogCompactionEnabled(),
+		ManualJob:                  manualCompactionJob(s.hashStore.ManualCompactionStatus()),
+		Satellites:                 make([]SatelliteCompaction, 0, len(stats)),
 	}
+	data.Compacting = data.ManualJob.State == string(piecestore.ManualCompactionRunning)
 
 	for _, stat := range stats {
 		satellite := SatelliteCompaction{
@@ -82,6 +109,7 @@ func (s *Service) GetCompactionData(ctx context.Context) (_ *CompactionInfo, err
 					ProcessedRecords: store.Compaction.ProcessedRecords,
 					TotalRecords:     store.Compaction.TotalRecords,
 				}
+				satellite.Mode = stat.Database.CompactionMode.String()
 				break
 			}
 		}
@@ -94,6 +122,43 @@ func (s *Service) GetCompactionData(ctx context.Context) (_ *CompactionInfo, err
 	}
 
 	return data, nil
+}
+
+// StartManualCompaction starts an asynchronous full compaction job.
+func (s *Service) StartManualCompaction(ctx context.Context) (_ ManualCompactionJob, err error) {
+	defer mon.Task()(&ctx)(&err)
+	status, err := s.hashStore.StartManualCompaction()
+	return manualCompactionJob(status), err
+}
+
+func manualCompactionJob(status piecestore.ManualCompactionStatus) ManualCompactionJob {
+	job := ManualCompactionJob{
+		ID:                  status.ID,
+		State:               string(status.State),
+		TotalSatellites:     status.TotalSatellites,
+		ProcessedSatellites: status.ProcessedSatellites,
+		Results:             make([]ManualCompactionResult, 0, len(status.Results)),
+	}
+	if !status.StartedAt.IsZero() {
+		startedAt := status.StartedAt
+		job.StartedAt = &startedAt
+	}
+	if !status.FinishedAt.IsZero() {
+		finishedAt := status.FinishedAt
+		job.FinishedAt = &finishedAt
+	}
+	if status.CurrentSatellite != (storj.NodeID{}) {
+		currentSatellite := status.CurrentSatellite
+		job.CurrentSatellite = &currentSatellite
+	}
+	for _, result := range status.Results {
+		job.Results = append(job.Results, ManualCompactionResult{
+			SatelliteID: result.SatelliteID,
+			Status:      result.Status,
+			Error:       result.Error,
+		})
+	}
+	return job
 }
 
 func compactionTotals(stats hashstore.DBStats) CompactionTotals {

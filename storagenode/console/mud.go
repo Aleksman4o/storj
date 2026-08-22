@@ -12,6 +12,7 @@ import (
 	"storj.io/storj/private/server"
 	"storj.io/storj/private/version/checker"
 	"storj.io/storj/shared/mud"
+	"storj.io/storj/storagenode/apikeys"
 	"storj.io/storj/storagenode/bandwidth"
 	"storj.io/storj/storagenode/contact"
 	"storj.io/storj/storagenode/monitor"
@@ -33,7 +34,7 @@ func Module(ball *mud.Ball) {
 		pingStats *contact.PingStats, contact *contact.Service, estimation *estimatedpayouts.Service,
 		walletFeatures operator.WalletFeatures, quicStats *contact.QUICStats,
 		spaceReport monitor.SpaceReport, hashStore *piecestore.HashStoreBackend,
-		server *server.Server, config operator.Config) (*Service, error) {
+		apiKeysDB apikeys.DB, server *server.Server, config operator.Config) (*Service, error) {
 
 		_, port, _ := net.SplitHostPort(server.Addr().String())
 		return NewService(log, bandwidth, version,
@@ -41,7 +42,7 @@ func Module(ball *mud.Ball) {
 			reputationDB, storageUsageDB, pricingDB, satelliteDB,
 			pingStats, contact, estimation,
 			config.WalletFeatures, port, quicStats,
-			spaceReport, hashStore)
+			spaceReport, hashStore, apikeys.NewService(apiKeysDB))
 	})
 	mud.View[operator.Config, operator.WalletFeatures](ball, func(config operator.Config) operator.WalletFeatures {
 		return config.WalletFeatures
