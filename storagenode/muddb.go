@@ -11,6 +11,7 @@ import (
 	"go.uber.org/zap"
 
 	"storj.io/storj/shared/mud"
+	"storj.io/storj/storagenode/apikeys"
 	"storj.io/storj/storagenode/bandwidth"
 	"storj.io/storj/storagenode/blobstore/filestore"
 	"storj.io/storj/storagenode/pieces"
@@ -39,6 +40,7 @@ func DBModule(ball *mud.Ball) {
 	mud.View(ball, DB.PieceSpaceUsedDB)
 	mud.View(ball, DB.StorageUsage)
 	mud.View(ball, DB.UsedSpacePerPrefix)
+	mud.View[DB, apikeys.DB](ball, DB.APIKeys)
 }
 
 // NewDB will create (+ test + migrate) new DB instance for storagenodes.
