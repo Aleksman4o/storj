@@ -5,7 +5,9 @@ package consoleapi
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -14,6 +16,7 @@ import (
 
 	"storj.io/common/storj"
 	"storj.io/storj/storagenode/console"
+	"storj.io/storj/storagenode/piecestore"
 )
 
 // ErrStorageNodeAPI - console storagenode api error type.
@@ -70,6 +73,59 @@ func (dashboard *StorageNode) Compaction(w http.ResponseWriter, r *http.Request)
 
 	if err := json.NewEncoder(w).Encode(data); err != nil {
 		dashboard.log.Error("failed to encode json response", zap.Error(ErrStorageNodeAPI.Wrap(err)))
+	}
+}
+
+// StartCompaction handles requests to start an asynchronous manual full compaction.
+func (dashboard *StorageNode) StartCompaction(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	var err error
+	defer mon.Task()(&ctx)(&err)
+
+	w.Header().Set(contentType, applicationJSON)
+
+	fields := strings.Fields(r.Header.Get("Authorization"))
+	if len(fields) != 2 || !strings.EqualFold(fields[0], "Bearer") {
+		w.Header().Set("WWW-Authenticate", "Bearer")
+		dashboard.serveCompactionError(w, http.StatusUnauthorized, "unauthorized", "a valid multinode API key is required")
+		return
+	}
+	if err := dashboard.service.AuthenticateAPIKey(ctx, fields[1]); err != nil {
+		w.Header().Set("WWW-Authenticate", "Bearer")
+		dashboard.serveCompactionError(w, http.StatusUnauthorized, "unauthorized", "a valid multinode API key is required")
+		return
+	}
+
+	job, err := dashboard.service.StartManualCompaction(ctx)
+	if err != nil {
+		switch {
+		case errors.Is(err, piecestore.ErrManualCompactionDisabled):
+			dashboard.serveCompactionError(w, http.StatusPreconditionFailed, "manual_log_compaction_disabled", err.Error())
+		case errors.Is(err, piecestore.ErrManualCompactionRunning):
+			dashboard.serveCompactionError(w, http.StatusConflict, "manual_compaction_running", err.Error())
+		case errors.Is(err, piecestore.ErrHashStoreBackendClosed):
+			dashboard.serveCompactionError(w, http.StatusServiceUnavailable, "hashstore_closed", err.Error())
+		default:
+			dashboard.serveCompactionError(w, http.StatusInternalServerError, "manual_compaction_failed", err.Error())
+		}
+		return
+	}
+
+	w.WriteHeader(http.StatusAccepted)
+	if err := json.NewEncoder(w).Encode(struct {
+		ManualJob console.ManualCompactionJob `json:"manualJob"`
+	}{ManualJob: job}); err != nil {
+		dashboard.log.Error("failed to encode manual compaction response", zap.Error(ErrStorageNodeAPI.Wrap(err)))
+	}
+}
+
+func (dashboard *StorageNode) serveCompactionError(w http.ResponseWriter, status int, code, message string) {
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(struct {
+		Code  string `json:"code"`
+		Error string `json:"error"`
+	}{Code: code, Error: message}); err != nil {
+		dashboard.log.Error("failed to encode compaction error", zap.Error(ErrStorageNodeAPI.Wrap(err)))
 	}
 }
 
