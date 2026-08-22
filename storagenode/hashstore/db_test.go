@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -499,6 +500,51 @@ func testDB_BackgroundCompaction(t *testing.T, cfg Config) {
 	})
 }
 
+func TestDB_ManualLogCompactionMakesBackgroundTableOnly(t *testing.T) {
+	forAllTables(t, testDB_ManualLogCompactionMakesBackgroundTableOnly)
+}
+
+func testDB_ManualLogCompactionMakesBackgroundTableOnly(t *testing.T, cfg Config) {
+	cfg.Compaction.ManualLogCompaction = true
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	db := newTestDB(t, cfg, WithShouldTrash(func(ctx context.Context, key Key, created time.Time) bool {
+		once.Do(func() { close(started) })
+		select {
+		case <-release:
+			return false
+		case <-ctx.Done():
+			return false
+		}
+	}))
+	defer db.Close()
+
+	db.AssertCreate()
+
+	// Make the active store the oldest so the normal background selector swaps it to passive and
+	// starts compaction on the store containing the record above.
+	db.mu.Lock()
+	active := db.active
+	stats := active.Stats()
+	active.today = func() uint32 { return stats.Today + 1 }
+	db.mu.Unlock()
+
+	db.checkBackgroundCompactions()
+	<-started
+
+	db.mu.Lock()
+	state := db.compact
+	db.mu.Unlock()
+	require.NotNil(t, state)
+	require.Equal(t, CompactTableOnly, state.mode)
+
+	close(release)
+	state.done.Wait()
+	require.NoError(t, state.done.Err())
+}
+
 func TestDB_BackgroundCompactionLoop(t *testing.T) {
 	forAllTables(t, testDB_BackgroundCompactionLoop)
 }
@@ -575,6 +621,53 @@ func testDB_CompactCallWaitsForCurrentCompaction(t *testing.T, cfg Config) {
 	}()
 
 	assert.NoError(t, db.Compact(t.Context()))
+}
+
+func TestDB_FullCompactionDoesNotCountTableOnlyAsComplete(t *testing.T) {
+	forAllTables(t, testDB_FullCompactionDoesNotCountTableOnlyAsComplete)
+}
+
+func testDB_FullCompactionDoesNotCountTableOnlyAsComplete(t *testing.T, cfg Config) {
+	cfg.Compaction.ManualLogCompaction = true
+	cfg.Compaction.MaxLogSize = 1024
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	db := newTestDB(t, cfg, WithShouldTrash(func(ctx context.Context, key Key, created time.Time) bool {
+		once.Do(func() { close(started) })
+		select {
+		case <-release:
+			return false
+		case <-ctx.Done():
+			return false
+		}
+	}))
+	defer db.Close()
+
+	createInPassive := func(expires time.Time) {
+		writer, err := db.passive.Create(t.Context(), newKey(), expires)
+		require.NoError(t, err)
+		_, err = writer.Write(make([]byte, 512))
+		require.NoError(t, err)
+		require.NoError(t, writer.Close())
+	}
+	createInPassive(time.Time{})
+	createInPassive(time.Unix(1, 0))
+
+	db.mu.Lock()
+	tableOnly := db.beginPassiveCompaction(CompactTableOnly)
+	db.mu.Unlock()
+	<-started
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- db.Compact(t.Context()) }()
+	waitForGoroutine("hashstore.(*DB).Compact", "[select]")
+	close(release)
+
+	require.NoError(t, <-errCh)
+	require.NoError(t, tableOnly.done.Err())
+	require.Positive(t, tableOnly.store.Stats().DataRewritten)
 }
 
 func TestDB_SetupDB_FailsToOpen(t *testing.T) {

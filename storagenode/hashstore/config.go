@@ -62,6 +62,7 @@ type CompactionCfg struct {
 	AliveFraction          float64 `help:"if the log file is not this alive, compact it" default:"0.25"`
 	ProbabilityPower       float64 `help:"power to raise the rewrite probability to. >1 means must be closer to the alive fraction to be compacted, <1 means the opposite" default:"2.0"`
 	RewriteMultiple        float64 `help:"multiple of the hashtbl to rewrite in a single compaction" default:"10"`
+	ManualLogCompaction    bool    `help:"keep automatic compactions table-only and allow full log compaction through the operator API" default:"false"`
 	Salvage                bool    `help:"allow compaction to discard records that are proven unreadable or beyond the end of a truncated log" default:"false"`
 	DeleteTrashImmediately bool    `help:"if set, deletes all trash immediately instead of after the ttl" default:"false" hidden:"true"`
 	OrderedRewrite         bool    `help:"controls if we collect records and sort them and rewrite them before the hashtbl" default:"true"`
@@ -129,6 +130,7 @@ func CreateDefaultConfig(kind TableKind, mmap bool) Config {
 			AliveFraction:          0.25,
 			ProbabilityPower:       2.0,
 			RewriteMultiple:        10,
+			ManualLogCompaction:    false,
 			Salvage:                false,
 			DeleteTrashImmediately: false,
 			OrderedRewrite:         true,

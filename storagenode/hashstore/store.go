@@ -847,10 +847,34 @@ func (s *Store) reviveRecord(ctx context.Context, fh *os.File, rec Record) (err 
 	return nil
 }
 
+// CompactMode controls whether compaction may rewrite live data from partially dead log files.
+type CompactMode uint8
+
+const (
+	// CompactFull performs the existing table compaction and selective log rewriting.
+	// It is the zero value so existing callers retain their behavior.
+	CompactFull CompactMode = iota
+	// CompactTableOnly rebuilds the table and removes fully dead logs without rewriting live data.
+	CompactTableOnly
+)
+
+// String returns the human-readable compaction mode.
+func (mode CompactMode) String() string {
+	switch mode {
+	case CompactFull:
+		return "full"
+	case CompactTableOnly:
+		return "table"
+	default:
+		return "unknown"
+	}
+}
+
 // CompactArguments are the arguments for a compaction so they can be passed in by a struct literal.
 type CompactArguments struct {
 	ShouldTrash func(ctx context.Context, key Key, created time.Time) bool
 	LastRestore time.Time
+	Mode        CompactMode
 }
 
 // Compact removes keys and files that are definitely expired, and marks keys that are determined
@@ -858,6 +882,9 @@ type CompactArguments struct {
 // dead data.
 func (s *Store) Compact(ctx context.Context, args CompactArguments) (err error) {
 	defer mon.Task()(&ctx)(&err)
+	if args.Mode != CompactFull && args.Mode != CompactTableOnly {
+		return Error.New("unknown compaction mode: %d", args.Mode)
+	}
 	defer func() {
 		s.stats.compactions.Add(1)
 		if err != nil {
@@ -868,7 +895,7 @@ func (s *Store) Compact(ctx context.Context, args CompactArguments) (err error) 
 	var compactionRounds int
 
 	start := time.Now()
-	s.log.Info("beginning compaction", zap.Any("stats", s.Stats()))
+	s.log.Info("beginning compaction", zap.String("mode", args.Mode.String()), zap.Any("stats", s.Stats()))
 	defer func() {
 		span := monkit.SpanFromCtx(ctx)
 		stats := s.Stats()
@@ -879,6 +906,7 @@ func (s *Store) Compact(ctx context.Context, args CompactArguments) (err error) 
 		span.Annotate("table_size", fmt.Sprintf("%d", stats.Table.TableSize))
 		span.Annotate("compaction_rounds", fmt.Sprintf("%d", compactionRounds))
 		s.log.Info("finished compaction",
+			zap.String("mode", args.Mode.String()),
 			zap.Duration("duration", time.Since(start)),
 			zap.Error(err),
 			zap.Any("stats", s.Stats()),
@@ -958,12 +986,12 @@ func (s *Store) Compact(ctx context.Context, args CompactArguments) (err error) 
 	// table each time we need to write a log file) but ensures we use minimal extra disk space when
 	// we need to rewrite multiple log files.
 	var salvageBudget *salvageBudget
-	if s.cfg.Compaction.Salvage {
+	if args.Mode == CompactFull && s.cfg.Compaction.Salvage {
 		salvageBudget = newSalvageBudget(s.cfg.Compaction.MaxLogSize)
 	}
 	for {
 		compactionRounds++
-		completed, err := s.compactOnce(ctx, today, expired, restored, args.ShouldTrash, salvageBudget)
+		completed, err := s.compactOnce(ctx, today, expired, restored, args.ShouldTrash, args.Mode, salvageBudget)
 		if err != nil {
 			return err
 		} else if completed {
@@ -980,14 +1008,16 @@ func (s *Store) compactOnce(
 	expired func(e Expiration) bool,
 	restored func(e Expiration) bool,
 	shouldTrash func(ctx context.Context, key Key, created time.Time) bool,
+	mode CompactMode,
 	salvageBudget *salvageBudget,
 ) (completed bool, err error) {
 	defer mon.Task()(&ctx)(&err)
 
 	start := time.Now()
-	s.log.Info("compact once started", zap.Uint32("today", today))
+	s.log.Info("compact once started", zap.Uint32("today", today), zap.String("mode", mode.String()))
 	defer func() {
 		s.log.Info("compact once finished",
+			zap.String("mode", mode.String()),
 			zap.Duration("duration", time.Since(start)),
 			zap.Bool("completed", completed),
 			zap.Error(err),
@@ -1101,55 +1131,57 @@ func (s *Store) compactOnce(
 	// of their dead sizes for quick lookup so we can prioritize them.
 	dead := make(map[uint64]uint64)
 	rewriteCandidates := make(map[uint64]bool)
-	if err := s.lfs.Range(func(id uint64, lf *logFile) (bool, error) {
-		if err := ctx.Err(); err != nil {
+	if mode == CompactFull {
+		if err := s.lfs.Range(func(id uint64, lf *logFile) (bool, error) {
+			if err := ctx.Err(); err != nil {
+				return false, err
+			}
+
+			size := lf.size.Load()
+			dead[lf.id] = size - alive[lf.id]
+
+			if func() bool {
+				// if the log is empty, no need to delete it just to create it again later.
+				if size == 0 {
+					return false
+				}
+				// compute the alive percent. if it's zero, always try to rewrite it.
+				alive := float64(alive[id]) / float64(size)
+				if alive == 0 {
+					return true
+				}
+				// compute the probability and include it that frequently.
+				prob := s.compactionProbabilityFactor() * (1 - alive) / alive
+				return mwc.Float64() < math.Pow(prob, s.cfg.Compaction.ProbabilityPower)
+			}() {
+				rewriteCandidates[id] = true
+			}
+
+			return true, nil
+		}); err != nil {
 			return false, err
 		}
 
-		size := lf.size.Load()
-		dead[lf.id] = size - alive[lf.id]
-
-		if func() bool {
-			// if the log is empty, no need to delete it just to create it again later.
-			if size == 0 {
-				return false
+		// if we have no rewrite candidates, then rewrite the log with the largest amount of dead data.
+		// this helps the steady state of a node that is basically full to more eagerly reclaim space
+		// for more uploads.
+		if len(rewriteCandidates) == 0 {
+			var maxDead uint64
+			var maxLog *logFile
+			_ = s.lfs.Range(func(id uint64, lf *logFile) (bool, error) {
+				if amount := dead[id]; amount > maxDead {
+					maxDead, maxLog = amount, lf
+				}
+				return true, nil
+			})
+			if maxLog != nil {
+				s.log.Info("including log due to no rewrite candidates",
+					zap.Uint64("id", maxLog.id),
+					zap.String("path", maxLog.fh.Name()),
+					zapHumanBytes("dead", maxDead),
+				)
+				rewriteCandidates[maxLog.id] = true
 			}
-			// compute the alive percent. if it's zero, always try to rewrite it.
-			alive := float64(alive[id]) / float64(size)
-			if alive == 0 {
-				return true
-			}
-			// compute the probability and include it that frequently.
-			prob := s.compactionProbabilityFactor() * (1 - alive) / alive
-			return mwc.Float64() < math.Pow(prob, s.cfg.Compaction.ProbabilityPower)
-		}() {
-			rewriteCandidates[id] = true
-		}
-
-		return true, nil
-	}); err != nil {
-		return false, err
-	}
-
-	// if we have no rewrite candidates, then rewrite the log with the largest amount of dead data.
-	// this helps the steady state of a node that is basically full to more eagerly reclaim space
-	// for more uploads.
-	if len(rewriteCandidates) == 0 {
-		var maxDead uint64
-		var maxLog *logFile
-		_ = s.lfs.Range(func(id uint64, lf *logFile) (bool, error) {
-			if amount := dead[id]; amount > maxDead {
-				maxDead, maxLog = amount, lf
-			}
-			return true, nil
-		})
-		if maxLog != nil {
-			s.log.Info("including log due to no rewrite candidates",
-				zap.Uint64("id", maxLog.id),
-				zap.String("path", maxLog.fh.Name()),
-				zapHumanBytes("dead", maxDead),
-			)
-			rewriteCandidates[maxLog.id] = true
 		}
 	}
 
@@ -1521,6 +1553,12 @@ func (s *Store) compactOnce(
 	// if we rewrote every log file that we could potentially rewrite, then we're done. len is
 	// sufficient here because rewrite is a subset of rewriteCandidates. also if our rewrite
 	// multiple is 0, then we're done because we unlinked all the fully dead log files already.
+	if mode == CompactTableOnly {
+		// Logs made fully dead by removing expired records were still referenced by the table at the
+		// beginning of this round. Run one more table-only round so they are recognized and removed;
+		// the second round exits early without writing another table when nothing else changed.
+		return expiredCtr.count == 0, nil
+	}
 	return len(rewriteCandidates) == len(rewrite) || s.cfg.Compaction.RewriteMultiple == 0, nil
 }
 

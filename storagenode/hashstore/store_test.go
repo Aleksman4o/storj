@@ -1476,6 +1476,37 @@ func testStore_RewriteMultipleZeroRemovesFullyDeadLogs(t *testing.T, cfg Config)
 	}
 }
 
+func TestStore_TableOnlyDoesNotRewritePartiallyDeadLogs(t *testing.T) {
+	forAllTables(t, testStore_TableOnlyDoesNotRewritePartiallyDeadLogs)
+}
+
+func testStore_TableOnlyDoesNotRewritePartiallyDeadLogs(t *testing.T, cfg Config) {
+	cfg.Compaction.MaxLogSize = 1024
+
+	s := newTestStore(t, cfg)
+	defer s.Close()
+
+	alive := s.AssertCreate(WithDataSize(512))
+	dead := s.AssertCreate(WithDataSize(512), WithTTL(time.Unix(1, 0)))
+	fullyDead := s.AssertCreate(WithDataSize(512), WithTTL(time.Unix(1, 0)))
+
+	assert.Equal(t, s.LogFile(alive), 1)
+	assert.Equal(t, s.LogFile(dead), 1)
+	assert.Equal(t, s.LogFile(fullyDead), 2)
+
+	assert.NoError(t, s.Compact(t.Context(), CompactArguments{Mode: CompactTableOnly}))
+
+	// The expired records disappear from the table and the fully dead second log is removed, but
+	// the live record in the partially dead first log keeps its original physical coordinates.
+	assert.Equal(t, s.LogFile(alive), 1)
+	s.AssertNotExist(dead)
+	s.AssertNotExist(fullyDead)
+
+	stats := s.Stats()
+	assert.Equal(t, stats.DataRewritten, 0)
+	assert.That(t, stats.DataReclaimed > 0)
+}
+
 func TestStore_CompactionCanceledAfterPartialRewrite(t *testing.T) {
 	s := newTestStore(t, defaultConfig())
 	defer s.Close()

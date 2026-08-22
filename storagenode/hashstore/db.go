@@ -28,6 +28,7 @@ const (
 
 type compactState struct {
 	store  *Store
+	mode   CompactMode
 	cancel func()
 	done   drpcsignal.Signal // set when compaction is done
 }
@@ -47,10 +48,11 @@ type AmnestyCallback func(context.Context, []Key, AmnestyReason)
 
 // DB is a database that stores pieces.
 type DB struct {
-	logsPath  string // directory for log files (binary).
-	tablePath string // directory for metadata (table).
-	log       *zap.Logger
-	cbs       Callbacks
+	logsPath            string // directory for log files (binary).
+	tablePath           string // directory for metadata (table).
+	log                 *zap.Logger
+	cbs                 Callbacks
+	manualLogCompaction bool
 
 	closed drpcsignal.Signal // closed state
 	cloErr error             // close error
@@ -103,10 +105,11 @@ func New(
 
 	// partially initialize the database so that we can close it if there's an error.
 	d := &DB{
-		logsPath:  logsPath,
-		tablePath: tablePath,
-		log:       log,
-		cbs:       cbs,
+		logsPath:            logsPath,
+		tablePath:           tablePath,
+		log:                 log,
+		cbs:                 cbs,
+		manualLogCompaction: cfg.Compaction.ManualLogCompaction,
 	}
 	defer func() {
 		if err != nil {
@@ -151,7 +154,7 @@ func New(
 	// if the passive store's load is too high, immediately begin compacting it. this will allow us
 	// to absorb writes more quickly if the active store becomes loaded.
 	if d.passive.Load() >= db_CompactLoad {
-		d.beginPassiveCompaction()
+		d.beginPassiveCompaction(d.automaticCompactionMode())
 	}
 
 	// start a background goroutine to ensure that the database compacts the store at least once
@@ -222,6 +225,7 @@ type DBStats struct {
 	LogsMismatched int // number of log files checked and mismatched
 
 	Compacting         bool        // if true, a background compaction is in progress.
+	CompactionMode     CompactMode // mode of the current compaction.
 	Compactions        uint64      // total number of compactions that finished on either store.
 	CompactionFailures uint64      // total number of failed compactions on either store.
 	Active             int         // which store is currently active
@@ -238,6 +242,10 @@ func (d *DB) Stats() (DBStats, StoreStats, StoreStats) {
 	d.mu.Lock()
 	s0, s1, active := d.active, d.passive, 0
 	compacting := d.compact != nil
+	var compactionMode CompactMode
+	if d.compact != nil {
+		compactionMode = d.compact.mode
+	}
 	d.mu.Unlock()
 
 	// sort them so s0 and s1 always get the same tag values.
@@ -280,6 +288,7 @@ func (d *DB) Stats() (DBStats, StoreStats, StoreStats) {
 		LogsMismatched: s0st.LogsMismatched + s1st.LogsMismatched,
 
 		Compacting:         compacting,
+		CompactionMode:     compactionMode,
 		Compactions:        s0st.Compactions + s1st.Compactions,
 		CompactionFailures: s0st.CompactionFailures + s1st.CompactionFailures,
 		Active:             active,
@@ -374,7 +383,7 @@ func (d *DB) Create(ctx context.Context, key Key, expires time.Time) (_ *Writer,
 		// no compaction in progress already when one is indicated by the load, so swap active and
 		// begin the compaction.
 		d.swapStoresLocked()
-		d.beginPassiveCompaction()
+		d.beginPassiveCompaction(d.automaticCompactionMode())
 	}
 
 	return d.active.Create(ctx, key, expires)
@@ -466,8 +475,9 @@ func (d *DB) Read(ctx context.Context, key Key) (r *Reader, err error) {
 	return nil, Error.Wrap(fs.ErrNotExist)
 }
 
-// Compact observes the result of compaction of both stores and returns the combined errors. If a
-// compaction is ongoing when it is called, it uses the result of that compaction.
+// Compact performs full compaction of both stores and returns the combined errors. If a full
+// compaction is already running, its result is reused. A running table-only compaction is awaited,
+// but does not satisfy the full compaction request.
 func (d *DB) Compact(ctx context.Context) (err error) {
 	defer mon.Task()(&ctx)(&err)
 
@@ -494,7 +504,7 @@ func (d *DB) Compact(ctx context.Context) (err error) {
 				d.swapStoresLocked()
 			}
 
-			return d.beginPassiveCompaction()
+			return d.beginPassiveCompaction(CompactFull)
 		}()
 
 		// we should always have a compaction ongoing at this point that we're waiting for. it's
@@ -510,8 +520,12 @@ func (d *DB) Compact(ctx context.Context) (err error) {
 		case <-d.closed.Signal():
 			return signalError(&d.closed)
 		case <-compact.done.Signal():
-			eg.Add(compact.done.Err())
-			compacted[compact.store] = struct{}{}
+			// A table-only compaction may have been running when a full compaction was
+			// requested. Wait for it, but do not count it as satisfying the full request.
+			if compact.mode == CompactFull {
+				eg.Add(compact.done.Err())
+				compacted[compact.store] = struct{}{}
+			}
 		}
 	}
 
@@ -564,7 +578,14 @@ func (d *DB) Sort(ctx context.Context, keys []Key) (sorted []Key, err error) {
 	return sorted, nil
 }
 
-func (d *DB) beginPassiveCompaction() *compactState {
+func (d *DB) automaticCompactionMode() CompactMode {
+	if d.manualLogCompaction {
+		return CompactTableOnly
+	}
+	return CompactFull
+}
+
+func (d *DB) beginPassiveCompaction(mode CompactMode) *compactState {
 	// sanity check: don't overwrite an existing compaction. this is a programmer error. we don't
 	// panic or anything because the code kinda assumes that the stores are arbitrarily loaded in
 	// many places, so skipping this compaction isn't the end of the world.
@@ -575,6 +596,7 @@ func (d *DB) beginPassiveCompaction() *compactState {
 	ctx, cancel := context.WithCancel(context.Background())
 	d.compact = &compactState{
 		store:  d.passive,
+		mode:   mode,
 		cancel: cancel,
 	}
 	go d.performPassiveCompaction(ctx, d.compact)
@@ -648,7 +670,7 @@ func (d *DB) checkBackgroundCompactions() {
 		d.swapStoresLocked()
 	}
 
-	d.beginPassiveCompaction()
+	d.beginPassiveCompaction(d.automaticCompactionMode())
 }
 
 func (d *DB) performPassiveCompaction(ctx context.Context, compact *compactState) {
@@ -658,6 +680,7 @@ func (d *DB) performPassiveCompaction(ctx context.Context, compact *compactState
 	err = compact.store.Compact(ctx, CompactArguments{
 		ShouldTrash: d.cbs.ShouldTrash,
 		LastRestore: d.cbs.LastRestore(ctx),
+		Mode:        compact.mode,
 	})
 	if err != nil {
 		d.log.Error("compaction failed", zap.Error(err))
