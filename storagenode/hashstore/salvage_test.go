@@ -723,8 +723,9 @@ func TestSalvageLimitsSpanCommittedRounds(t *testing.T) {
 	})
 }
 
-func TestConfigSalvageDisabledByDefault(t *testing.T) {
+func TestConfigSafetyFeaturesDisabledByDefault(t *testing.T) {
 	assert.False(t, defaultConfig().Compaction.Salvage)
+	assert.False(t, defaultConfig().Compaction.ManualLogCompaction)
 }
 
 func sortKeys(keys []Key) {
