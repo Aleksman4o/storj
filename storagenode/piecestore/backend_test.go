@@ -4,13 +4,17 @@
 package piecestore
 
 import (
+	"context"
+	"errors"
 	"io"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/spacemonkeygo/monkit/v3"
 	"github.com/stretchr/testify/require"
 	"github.com/zeebo/mwc"
+	"go.uber.org/zap"
 
 	"storj.io/common/pb"
 	"storj.io/common/storj"
@@ -19,6 +23,189 @@ import (
 	"storj.io/storj/storagenode/hashstore"
 	"storj.io/storj/storagenode/retain"
 )
+
+func TestHashStoreBackend_ManualCompactionDisabled(t *testing.T) {
+	ctx := testcontext.New(t)
+	backend, err := NewHashStoreBackend(ctx, hashstore.CreateDefaultConfig(hashstore.TableKind_HashTbl, false), t.TempDir(), "", nil, nil, zap.NewNop(), nil)
+	require.NoError(t, err)
+	defer ctx.Check(backend.Close)
+
+	status, err := backend.StartManualCompaction()
+	require.ErrorIs(t, err, ErrManualCompactionDisabled)
+	require.Equal(t, ManualCompactionIdle, status.State)
+	require.False(t, backend.ManualLogCompactionEnabled())
+}
+
+func TestHashStoreBackend_ManualCompactionRunsSequentialJob(t *testing.T) {
+	ctx := testcontext.New(t)
+	cfg := hashstore.CreateDefaultConfig(hashstore.TableKind_HashTbl, false)
+	cfg.Compaction.ManualLogCompaction = true
+	backend, err := NewHashStoreBackend(ctx, cfg, t.TempDir(), "", nil, nil, zap.NewNop(), nil)
+	require.NoError(t, err)
+	defer ctx.Check(backend.Close)
+
+	type blockedDB struct {
+		db      *hashstore.DB
+		started chan struct{}
+		release chan struct{}
+	}
+	newBlockedDB := func(key byte) blockedDB {
+		started := make(chan struct{})
+		release := make(chan struct{})
+		var once sync.Once
+		db, err := hashstore.New(ctx, cfg, t.TempDir(), "", zap.NewNop(), hashstore.Callbacks{
+			ShouldTrash: func(ctx context.Context, key hashstore.Key, created time.Time) bool {
+				once.Do(func() { close(started) })
+				select {
+				case <-release:
+					return false
+				case <-ctx.Done():
+					return false
+				}
+			},
+		})
+		require.NoError(t, err)
+
+		writer, err := db.Create(ctx, hashstore.Key{key}, time.Time{})
+		require.NoError(t, err)
+		_, err = writer.Write([]byte{key})
+		require.NoError(t, err)
+		require.NoError(t, writer.Close())
+		return blockedDB{db: db, started: started, release: release}
+	}
+
+	first := newBlockedDB(1)
+	second := newBlockedDB(2)
+	firstSatellite := storj.NodeID{1}
+	secondSatellite := storj.NodeID{2}
+
+	backend.mu.Lock()
+	backend.dbs[firstSatellite] = first.db
+	backend.dbs[secondSatellite] = second.db
+	backend.mu.Unlock()
+
+	status, err := backend.StartManualCompaction()
+	require.NoError(t, err)
+	require.Equal(t, ManualCompactionRunning, status.State)
+	require.Equal(t, 2, status.TotalSatellites)
+	<-first.started
+	select {
+	case <-second.started:
+		t.Fatal("second satellite compaction started before the first completed")
+	default:
+	}
+
+	running := backend.ManualCompactionStatus()
+	require.Equal(t, firstSatellite, running.CurrentSatellite)
+	_, err = backend.StartManualCompaction()
+	require.ErrorIs(t, err, ErrManualCompactionRunning)
+
+	close(first.release)
+	<-second.started
+	running = backend.ManualCompactionStatus()
+	require.Equal(t, ManualCompactionRunning, running.State)
+	require.Equal(t, secondSatellite, running.CurrentSatellite)
+	require.Equal(t, 1, running.ProcessedSatellites)
+	close(second.release)
+	require.Eventually(t, func() bool {
+		return backend.ManualCompactionStatus().State != ManualCompactionRunning
+	}, 10*time.Second, time.Millisecond)
+
+	finished := backend.ManualCompactionStatus()
+	require.Equal(t, ManualCompactionSucceeded, finished.State)
+	require.Equal(t, 2, finished.ProcessedSatellites)
+	require.Len(t, finished.Results, 2)
+	require.Equal(t, "succeeded", finished.Results[0].Status)
+	require.Equal(t, "succeeded", finished.Results[1].Status)
+}
+
+func TestHashStoreBackend_ManualCompactionContinuesAfterSatelliteFailure(t *testing.T) {
+	ctx := testcontext.New(t)
+	cfg := hashstore.CreateDefaultConfig(hashstore.TableKind_HashTbl, false)
+	cfg.Compaction.ManualLogCompaction = true
+	backend, err := NewHashStoreBackend(ctx, cfg, t.TempDir(), "", nil, nil, zap.NewNop(), nil)
+	require.NoError(t, err)
+	defer ctx.Check(backend.Close)
+
+	failedDB, err := hashstore.New(ctx, cfg, t.TempDir(), "", zap.NewNop(), hashstore.Callbacks{})
+	require.NoError(t, err)
+	require.NoError(t, failedDB.Close())
+
+	succeeded := make(chan struct{})
+	var once sync.Once
+	succeededDB, err := hashstore.New(ctx, cfg, t.TempDir(), "", zap.NewNop(), hashstore.Callbacks{
+		ShouldTrash: func(context.Context, hashstore.Key, time.Time) bool {
+			once.Do(func() { close(succeeded) })
+			return false
+		},
+	})
+	require.NoError(t, err)
+	writer, err := succeededDB.Create(ctx, hashstore.Key{1}, time.Time{})
+	require.NoError(t, err)
+	_, err = writer.Write([]byte{1})
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+
+	backend.mu.Lock()
+	backend.dbs[storj.NodeID{1}] = failedDB
+	backend.dbs[storj.NodeID{2}] = succeededDB
+	backend.mu.Unlock()
+
+	_, err = backend.StartManualCompaction()
+	require.NoError(t, err)
+	<-succeeded
+	require.Eventually(t, func() bool {
+		return backend.ManualCompactionStatus().State != ManualCompactionRunning
+	}, 10*time.Second, time.Millisecond)
+
+	finished := backend.ManualCompactionStatus()
+	require.Equal(t, ManualCompactionFailed, finished.State)
+	require.Equal(t, 2, finished.ProcessedSatellites)
+	require.Len(t, finished.Results, 2)
+	require.Equal(t, "failed", finished.Results[0].Status)
+	require.Equal(t, "succeeded", finished.Results[1].Status)
+}
+
+func TestHashStoreBackend_CloseCancelsManualCompaction(t *testing.T) {
+	ctx := testcontext.New(t)
+	cfg := hashstore.CreateDefaultConfig(hashstore.TableKind_HashTbl, false)
+	cfg.Compaction.ManualLogCompaction = true
+	backend, err := NewHashStoreBackend(ctx, cfg, t.TempDir(), "", nil, nil, zap.NewNop(), nil)
+	require.NoError(t, err)
+
+	started := make(chan struct{})
+	satelliteID := storj.NodeID{1}
+	db, err := hashstore.New(ctx, cfg, t.TempDir(), "", zap.NewNop(), hashstore.Callbacks{
+		ShouldTrash: func(ctx context.Context, key hashstore.Key, created time.Time) bool {
+			select {
+			case <-started:
+			default:
+				close(started)
+			}
+			<-ctx.Done()
+			return false
+		},
+	})
+	require.NoError(t, err)
+
+	writer, err := db.Create(ctx, hashstore.Key{1}, time.Time{})
+	require.NoError(t, err)
+	_, err = writer.Write([]byte{1})
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+
+	backend.mu.Lock()
+	backend.dbs[satelliteID] = db
+	backend.mu.Unlock()
+
+	_, err = backend.StartManualCompaction()
+	require.NoError(t, err)
+	<-started
+	require.NoError(t, backend.Close())
+	require.Equal(t, ManualCompactionCanceled, backend.ManualCompactionStatus().State)
+	_, err = backend.StartManualCompaction()
+	require.True(t, errors.Is(err, ErrHashStoreBackendClosed))
+}
 
 func TestHashStoreBackend_CompactionStats(t *testing.T) {
 	ctx := testcontext.New(t)
