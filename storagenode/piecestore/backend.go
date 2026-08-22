@@ -73,6 +73,64 @@ type HashStoreBackend struct {
 
 	mu  sync.Mutex
 	dbs map[storj.NodeID]*hashstore.DB
+
+	runnerCtx    context.Context
+	runnerCancel context.CancelFunc
+	runnerWG     sync.WaitGroup
+
+	manualMu      sync.Mutex
+	manualClosing bool
+	manualNextID  uint64
+	manualStatus  ManualCompactionStatus
+}
+
+// ManualCompactionState identifies the state of the latest manual compaction job.
+type ManualCompactionState string
+
+const (
+	// ManualCompactionIdle means no manual compaction has been started in this process.
+	ManualCompactionIdle ManualCompactionState = "idle"
+	// ManualCompactionRunning means a manual compaction is currently running.
+	ManualCompactionRunning ManualCompactionState = "running"
+	// ManualCompactionSucceeded means the latest manual compaction completed without failures.
+	ManualCompactionSucceeded ManualCompactionState = "succeeded"
+	// ManualCompactionFailed means at least one satellite failed during the latest manual compaction.
+	ManualCompactionFailed ManualCompactionState = "failed"
+	// ManualCompactionCanceled means node shutdown canceled the latest manual compaction.
+	ManualCompactionCanceled ManualCompactionState = "canceled"
+)
+
+var (
+	// ErrManualCompactionDisabled is returned when manual log compaction is not enabled.
+	ErrManualCompactionDisabled = errors.New("manual log compaction is disabled")
+	// ErrManualCompactionRunning is returned when a manual compaction is already running.
+	ErrManualCompactionRunning = errors.New("manual compaction is already running")
+	// ErrHashStoreBackendClosed is returned when the hashstore backend is closing.
+	ErrHashStoreBackendClosed = errors.New("hashstore backend is closed")
+)
+
+// ManualCompactionResult contains the result for one satellite in a manual compaction job.
+type ManualCompactionResult struct {
+	SatelliteID storj.NodeID
+	Status      string
+	Error       string
+}
+
+// ManualCompactionStatus contains a snapshot of the latest manual compaction job.
+type ManualCompactionStatus struct {
+	ID                  uint64
+	State               ManualCompactionState
+	StartedAt           time.Time
+	FinishedAt          time.Time
+	CurrentSatellite    storj.NodeID
+	TotalSatellites     int
+	ProcessedSatellites int
+	Results             []ManualCompactionResult
+}
+
+func (status ManualCompactionStatus) clone() ManualCompactionStatus {
+	status.Results = append([]ManualCompactionResult(nil), status.Results...)
+	return status
 }
 
 // NewHashStoreBackend constructs a new HashStoreBackend with the provided values. The log and hash
@@ -92,6 +150,8 @@ func NewHashStoreBackend(
 		tablePath = logsPath
 	}
 
+	runnerCtx, runnerCancel := context.WithCancel(context.Background())
+
 	hsb := &HashStoreBackend{
 		logsPath:  logsPath,
 		tablePath: tablePath,
@@ -101,7 +161,10 @@ func NewHashStoreBackend(
 		log:       log,
 		amnesty:   amnesty,
 
-		dbs: map[storj.NodeID]*hashstore.DB{},
+		dbs:          map[storj.NodeID]*hashstore.DB{},
+		runnerCtx:    runnerCtx,
+		runnerCancel: runnerCancel,
+		manualStatus: ManualCompactionStatus{State: ManualCompactionIdle},
 	}
 
 	// open any existing databases
@@ -150,8 +213,177 @@ func (hsb *HashStoreBackend) SalvageEnabled() bool {
 	return hsb.cfg.Compaction.Salvage
 }
 
+// ManualLogCompactionEnabled reports whether automatic compactions avoid rewriting partial logs
+// and the operator API may start full compactions.
+func (hsb *HashStoreBackend) ManualLogCompactionEnabled() bool {
+	return hsb.cfg.Compaction.ManualLogCompaction
+}
+
+// ManualCompactionStatus returns a snapshot of the latest manual compaction job.
+func (hsb *HashStoreBackend) ManualCompactionStatus() ManualCompactionStatus {
+	hsb.manualMu.Lock()
+	defer hsb.manualMu.Unlock()
+	return hsb.manualStatus.clone()
+}
+
+// StartManualCompaction starts one asynchronous full compaction job across all satellite DBs.
+// Satellite DBs are compacted sequentially, while their automatic table-only compactions remain
+// independent.
+func (hsb *HashStoreBackend) StartManualCompaction() (ManualCompactionStatus, error) {
+	if !hsb.ManualLogCompactionEnabled() {
+		return hsb.ManualCompactionStatus(), ErrManualCompactionDisabled
+	}
+
+	hsb.manualMu.Lock()
+	defer hsb.manualMu.Unlock()
+
+	if hsb.manualClosing {
+		return hsb.manualStatus.clone(), ErrHashStoreBackendClosed
+	}
+	if hsb.manualStatus.State == ManualCompactionRunning {
+		return hsb.manualStatus.clone(), ErrManualCompactionRunning
+	}
+
+	dbs := hsb.compactionDBsSnapshot()
+	hsb.manualNextID++
+	hsb.manualStatus = ManualCompactionStatus{
+		ID:              hsb.manualNextID,
+		State:           ManualCompactionRunning,
+		StartedAt:       time.Now().UTC(),
+		TotalSatellites: len(dbs),
+		Results:         make([]ManualCompactionResult, 0, len(dbs)),
+	}
+	status := hsb.manualStatus.clone()
+
+	hsb.runnerWG.Add(1)
+	hsb.log.Info("manual compaction job accepted",
+		zap.Uint64("job_id", status.ID),
+		zap.Int("satellite_count", status.TotalSatellites),
+	)
+	go hsb.runManualCompaction(status.ID, dbs)
+	return status, nil
+}
+
+type compactionDB struct {
+	satelliteID storj.NodeID
+	db          *hashstore.DB
+}
+
+func (hsb *HashStoreBackend) compactionDBsSnapshot() []compactionDB {
+	dbs := hsb.dbsCopy()
+	snapshot := make([]compactionDB, 0, len(dbs))
+	for satelliteID, db := range dbs {
+		snapshot = append(snapshot, compactionDB{satelliteID: satelliteID, db: db})
+	}
+	sort.Slice(snapshot, func(i, j int) bool {
+		return snapshot[i].satelliteID.String() < snapshot[j].satelliteID.String()
+	})
+	return snapshot
+}
+
+func (hsb *HashStoreBackend) isCurrentDB(entry compactionDB) bool {
+	hsb.mu.Lock()
+	defer hsb.mu.Unlock()
+	db, ok := hsb.dbs[entry.satelliteID]
+	return ok && db == entry.db
+}
+
+func (hsb *HashStoreBackend) runManualCompaction(jobID uint64, dbs []compactionDB) {
+	defer hsb.runnerWG.Done()
+
+	failed := false
+	canceled := false
+	for _, entry := range dbs {
+		if err := hsb.runnerCtx.Err(); err != nil {
+			canceled = true
+			break
+		}
+
+		if !hsb.isCurrentDB(entry) {
+			hsb.finishManualSatellite(jobID, entry.satelliteID, "skipped", "satellite removed")
+			continue
+		}
+
+		hsb.manualMu.Lock()
+		if hsb.manualStatus.ID == jobID && hsb.manualStatus.State == ManualCompactionRunning {
+			hsb.manualStatus.CurrentSatellite = entry.satelliteID
+		}
+		hsb.manualMu.Unlock()
+
+		hsb.log.Info("manual compaction starting satellite", zap.Stringer("satellite", entry.satelliteID))
+		err := entry.db.Compact(hsb.runnerCtx)
+		if err == nil {
+			hsb.finishManualSatellite(jobID, entry.satelliteID, "succeeded", "")
+			hsb.log.Info("manual compaction finished satellite", zap.Stringer("satellite", entry.satelliteID))
+			continue
+		}
+
+		if hsb.runnerCtx.Err() != nil {
+			canceled = true
+			break
+		}
+		if !hsb.isCurrentDB(entry) {
+			hsb.finishManualSatellite(jobID, entry.satelliteID, "skipped", "satellite removed")
+			continue
+		}
+
+		failed = true
+		hsb.finishManualSatellite(jobID, entry.satelliteID, "failed", err.Error())
+		hsb.log.Error("manual compaction failed for satellite",
+			zap.Stringer("satellite", entry.satelliteID),
+			zap.Error(err),
+		)
+	}
+
+	hsb.manualMu.Lock()
+	if hsb.manualStatus.ID != jobID {
+		hsb.manualMu.Unlock()
+		return
+	}
+	hsb.manualStatus.CurrentSatellite = storj.NodeID{}
+	hsb.manualStatus.FinishedAt = time.Now().UTC()
+	switch {
+	case canceled:
+		hsb.manualStatus.State = ManualCompactionCanceled
+	case failed:
+		hsb.manualStatus.State = ManualCompactionFailed
+	default:
+		hsb.manualStatus.State = ManualCompactionSucceeded
+	}
+	status := hsb.manualStatus.clone()
+	hsb.manualMu.Unlock()
+
+	hsb.log.Info("manual compaction job finished",
+		zap.Uint64("job_id", status.ID),
+		zap.String("state", string(status.State)),
+		zap.Int("processed_satellites", status.ProcessedSatellites),
+		zap.Int("satellite_count", status.TotalSatellites),
+		zap.Duration("duration", status.FinishedAt.Sub(status.StartedAt)),
+	)
+}
+
+func (hsb *HashStoreBackend) finishManualSatellite(jobID uint64, satelliteID storj.NodeID, status, errMessage string) {
+	hsb.manualMu.Lock()
+	defer hsb.manualMu.Unlock()
+	if hsb.manualStatus.ID != jobID || hsb.manualStatus.State != ManualCompactionRunning {
+		return
+	}
+	hsb.manualStatus.Results = append(hsb.manualStatus.Results, ManualCompactionResult{
+		SatelliteID: satelliteID,
+		Status:      status,
+		Error:       errMessage,
+	})
+	hsb.manualStatus.ProcessedSatellites++
+}
+
 // Close closes the HashStoreBackend.
 func (hsb *HashStoreBackend) Close() error {
+	hsb.manualMu.Lock()
+	hsb.manualClosing = true
+	hsb.runnerCancel()
+	hsb.manualMu.Unlock()
+	hsb.runnerWG.Wait()
+
 	hsb.mu.Lock()
 	defer hsb.mu.Unlock()
 
