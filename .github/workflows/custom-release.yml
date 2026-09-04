@@ -1,0 +1,194 @@
+name: Custom Storj release
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Git tag containing the custom Storj source
+        required: true
+        default: v1.160.28
+        type: string
+      release_tag:
+        description: GitHub release tag and embedded binary version
+        required: true
+        default: v1.160.28
+        type: string
+
+concurrency:
+  group: custom-storj-release-${{ inputs.release_tag }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build-binaries:
+    name: Build ${{ matrix.platform }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-amd64
+            bake_target: binaries-linux-amd64
+            output_dir: linux_amd64
+          - platform: linux-arm64
+            bake_target: binaries-linux-arm64
+            output_dir: linux_arm64
+          - platform: linux-arm
+            bake_target: binaries-linux-arm
+            output_dir: linux_arm
+          - platform: windows-amd64
+            bake_target: binaries-windows-amd64
+            output_dir: windows_amd64
+          - platform: freebsd-amd64
+            bake_target: binaries-freebsd-amd64
+            output_dir: freebsd_amd64
+
+    env:
+      BUILD_VERSION: ${{ inputs.release_tag }}
+      BUILD_RELEASE: "true"
+      COMPONENTS: ./cmd/multinode ./cmd/storagenode
+
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Verify source and release tag
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release tag: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          tag_commit="$(git rev-list -n 1 "$RELEASE_TAG")"
+          source_commit="$(git rev-parse HEAD)"
+          if [[ "$tag_commit" != "$source_commit" ]]; then
+            echo "Release tag $RELEASE_TAG does not point at checked-out source $source_commit" >&2
+            exit 1
+          fi
+          if [[ -n "$(git status --porcelain)" ]]; then
+            echo "Release source is dirty" >&2
+            exit 1
+          fi
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build with Storj release definitions
+        env:
+          BAKE_TARGET: ${{ matrix.bake_target }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx bake \
+            -f release.docker-bake.hcl \
+            "$BAKE_TARGET" \
+            --set "$BAKE_TARGET.args.COMPONENTS=$COMPONENTS" \
+            --set "$BAKE_TARGET.cache-from=type=gha,scope=storj-$BAKE_TARGET" \
+            --set "$BAKE_TARGET.cache-to=type=gha,mode=max,scope=storj-$BAKE_TARGET"
+
+      - name: Verify release binaries
+        shell: bash
+        run: ./scripts/release/check-release-binaries.sh "release/$BUILD_VERSION"
+
+      - name: Keep requested release components
+        env:
+          OUTPUT_DIR: ${{ matrix.output_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          find "release/$BUILD_VERSION/$OUTPUT_DIR" -maxdepth 1 -type f \
+            ! -name 'storagenode' \
+            ! -name 'storagenode.exe' \
+            ! -name 'multinode' \
+            ! -name 'multinode.exe' \
+            -delete
+
+      - name: Package with Storj release script
+        shell: bash
+        run: ./scripts/release/compress-binaries.sh "release/$BUILD_VERSION"
+
+      - name: Upload platform packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: storj-${{ inputs.release_tag }}-${{ matrix.platform }}
+          path: release/${{ inputs.release_tag }}/*.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-release:
+    name: Publish release assets
+    needs: build-binaries
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+
+    steps:
+      - name: Download platform packages
+        uses: actions/download-artifact@v7
+        with:
+          pattern: storj-${{ inputs.release_tag }}-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate checksums and verify asset set
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_count="$(find release-assets -maxdepth 1 -type f -name '*.zip' | wc -l)"
+          if [[ "$package_count" -ne 10 ]]; then
+            echo "Expected 10 binary packages, found $package_count" >&2
+            find release-assets -maxdepth 1 -type f -printf '%f\n' | sort
+            exit 1
+          fi
+          cd release-assets
+          sha256sum ./*.zip | sort -k 2 > sha256sums
+
+      - name: Attest release packages
+        id: attest
+        uses: actions/attest@v4
+        with:
+          subject-path: release-assets/*
+
+      - name: Add attestation bundle to release assets
+        env:
+          BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        shell: bash
+        run: cp "$BUNDLE_PATH" "release-assets/storj-${RELEASE_TAG}-attestation.sigstore.json"
+
+      - name: Create release when needed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" \
+              --verify-tag \
+              --title "$RELEASE_TAG" \
+              --notes "Custom build based on Storj. See the release notes for the changes from the corresponding upstream version."
+          fi
+
+      - name: Upload canonical release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        shell: bash
+        run: gh release upload "$RELEASE_TAG" release-assets/* --clobber
