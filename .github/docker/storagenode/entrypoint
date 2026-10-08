@@ -1,0 +1,51 @@
+#!/bin/bash
+
+set -euo pipefail
+
+storagenode_binary="${STORAGENODE_BINARY:-/app/bin/storagenode}"
+
+run_params=(
+    --config-dir config
+    --identity-dir identity
+)
+
+if [[ -n "${RUN_PARAMS:-}" ]]; then
+    # Preserve the public storagenode-docker interface. RUN_PARAMS has always
+    # been a whitespace-separated list, so quoted shell expressions are not
+    # evaluated here.
+    read -r -a extra_run_params <<< "${RUN_PARAMS}"
+    run_params=("${extra_run_params[@]}" "${run_params[@]}")
+fi
+
+if [[ -n "${VERSION_SERVER_URL:-}" ]]; then
+    run_params+=(--version.server-address="${VERSION_SERVER_URL}")
+fi
+
+: "${STORJ_CONSOLE_ADDRESS:=0.0.0.0:14002}"
+export STORJ_CONSOLE_ADDRESS
+
+if [[ -n "${STORAGE:-}" ]]; then
+    run_params+=(--storage.allocated-disk-space="${STORAGE}")
+fi
+if [[ -n "${ADDRESS:-}" ]]; then
+    run_params+=(--contact.external-address="${ADDRESS}")
+fi
+if [[ -n "${EMAIL:-}" ]]; then
+    run_params+=(--operator.email="${EMAIL}")
+fi
+if [[ -n "${WALLET:-}" ]]; then
+    run_params+=(--operator.wallet="${WALLET}")
+fi
+if [[ -n "${LOG_LEVEL:-}" ]]; then
+    run_params+=(--log.level="${LOG_LEVEL}")
+fi
+
+if [[ "${AUTO_UPDATE:-false}" == "true" ]]; then
+    echo "AUTO_UPDATE is not available in immutable custom images; update by pulling a new container image." >&2
+fi
+
+if [[ "${SETUP:-false}" == "true" ]]; then
+    exec "${storagenode_binary}" setup "${run_params[@]}" "$@"
+fi
+
+exec "${storagenode_binary}" run "${run_params[@]}" "$@"
