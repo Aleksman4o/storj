@@ -288,11 +288,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          index="$(docker buildx imagetools inspect "$IMAGE@$DIGEST" --raw)"
           for platform in linux/amd64 linux/arm64 linux/arm/v7; do
+            IFS=/ read -r os arch variant <<< "$platform"
+            platform_digest="$(jq -er --arg os "$os" --arg arch "$arch" --arg variant "${variant:-}" '
+              [.manifests[] | select(.platform.os == $os and .platform.architecture == $arch
+                and ($variant == "" or .platform.variant == $variant))]
+              | if length == 1 then .[0].digest else error("Expected one platform manifest") end
+            ' <<< "$index")"
             echo "Checking $platform"
             if ! output="$(docker run --rm --pull=always --platform "$platform" \
               --entrypoint "$BINARY_PATH" \
-              "$IMAGE@$DIGEST" version 2>&1)"; then
+              "$IMAGE@$platform_digest" version 2>&1)"; then
               printf '%s\n' "$output" >&2
               exit 1
             fi
