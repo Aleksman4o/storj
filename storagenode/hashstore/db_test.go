@@ -734,8 +734,12 @@ func testDB_FullCompactionDoesNotCountTableOnlyAsComplete(t *testing.T, cfg Conf
 	<-started
 
 	errCh := make(chan error, 1)
-	go func() { errCh <- db.Compact(t.Context()) }()
-	waitForGoroutine("hashstore.(*DB).Compact", "[select]")
+	ids := make(chan int, 1)
+	go func() {
+		ids <- goroutineID()
+		errCh <- db.Compact(t.Context())
+	}()
+	waitForGoroutine(<-ids, "hashstore.(*DB).Compact", "[select]")
 	close(release)
 
 	require.NoError(t, <-errCh)
