@@ -6,16 +6,21 @@ on:
       source_ref:
         description: Git tag containing the custom Storj source
         required: true
-        default: v1.160.28
+        default: v1.164.28
         type: string
       release_tag:
         description: GitHub release tag and embedded binary version
         required: true
-        default: v1.160.28
+        default: v1.164.28
         type: string
+      publish_latest:
+        description: Move the container image latest tags to this release
+        required: true
+        default: true
+        type: boolean
 
 concurrency:
-  group: custom-storj-release-${{ inputs.release_tag }}
+  group: custom-storj-release
   cancel-in-progress: false
 
 permissions:
@@ -128,9 +133,210 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  validate-container-packaging:
+    name: Validate container packaging
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out container packaging
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          sparse-checkout: .github/docker
+
+      - name: Test Storagenode entrypoint
+        shell: bash
+        run: |
+          bash -n .github/docker/storagenode/entrypoint
+          bash .github/docker/storagenode/entrypoint_test.sh
+
+  publish-images:
+    name: Publish ${{ matrix.component }} image
+    needs:
+      - build-binaries
+      - validate-container-packaging
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: storagenode
+            context: .github/docker/storagenode
+            dockerfile: .github/docker/storagenode/Dockerfile
+            binary_path: /app/bin/storagenode
+          - component: multinode
+            context: multinode-context
+            dockerfile: release-source/cmd/multinode/Dockerfile
+            binary_path: /app/multinode
+
+    steps:
+      - name: Check out container packaging
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          sparse-checkout: .github/docker
+
+      - name: Check out matching Storj source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_ref }}
+          path: release-source
+          sparse-checkout: cmd/multinode
+
+      - name: Record source commit
+        id: source
+        shell: bash
+        run: echo "commit=$(git -C release-source rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Download release binaries
+        uses: actions/download-artifact@v7
+        with:
+          pattern: storj-${{ inputs.release_tag }}-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Prepare container build contexts
+        env:
+          COMPONENT: ${{ matrix.component }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64 arm; do
+            archive="release-assets/${COMPONENT}_linux_${arch}.zip"
+            if [[ "$(unzip -Z1 "$archive")" != "$COMPONENT" ]]; then
+              echo "Unexpected content in $archive" >&2
+              unzip -Z1 "$archive" >&2
+              exit 1
+            fi
+            mkdir -p "container-binaries/linux_${arch}"
+            unzip -p "$archive" "$COMPONENT" > "container-binaries/linux_${arch}/${COMPONENT}"
+            chmod 0755 "container-binaries/linux_${arch}/${COMPONENT}"
+            test -s "container-binaries/linux_${arch}/${COMPONENT}"
+          done
+
+          mkdir -p multinode-context/cmd/multinode
+          cp release-source/cmd/multinode/entrypoint multinode-context/cmd/multinode/entrypoint
+
+      - name: Set registry image name
+        id: registry
+        env:
+          COMPONENT: ${{ matrix.component }}
+        shell: bash
+        run: |
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          echo "image=ghcr.io/${owner}/${COMPONENT}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Generate container metadata
+        id: metadata
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.registry.outputs.image }}
+          tags: |
+            type=raw,value=${{ inputs.release_tag }}
+          labels: |
+            org.opencontainers.image.revision=${{ steps.source.outputs.commit }}
+            org.opencontainers.image.version=${{ inputs.release_tag }}
+
+      - name: Build and publish multi-architecture image
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          build-contexts: |
+            binaries=${{ github.workspace }}/container-binaries
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          push: true
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          annotations: ${{ steps.metadata.outputs.annotations }}
+          cache-from: type=gha,scope=storj-${{ matrix.component }}-image
+          cache-to: type=gha,mode=max,scope=storj-${{ matrix.component }}-image
+          provenance: mode=max
+          sbom: true
+
+      - name: Verify published image
+        env:
+          BINARY_PATH: ${{ matrix.binary_path }}
+          IMAGE: ${{ steps.registry.outputs.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for platform in linux/amd64 linux/arm64 linux/arm/v7; do
+            output="$(docker run --rm --platform "$platform" \
+              --entrypoint "$BINARY_PATH" \
+              "$IMAGE@$DIGEST" version 2>&1)"
+            echo "$output"
+            grep -Fqx "Release build" <<< "$output"
+            grep -Fqx "Version: $RELEASE_TAG" <<< "$output"
+            grep -Fqx "Git commit: $SOURCE_COMMIT" <<< "$output"
+          done
+
+          if [[ "${{ matrix.component }}" == "storagenode" ]]; then
+            docker run --rm --platform linux/amd64 \
+              -e STORJ_HASHSTORE_COMPACTION_MANUAL_LOG_COMPACTION=true \
+              "$IMAGE@$DIGEST" --help
+          fi
+
+      - name: Attest container image
+        uses: actions/attest@v4
+        with:
+          subject-name: ${{ steps.registry.outputs.image }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Update latest after verification
+        if: ${{ inputs.publish_latest }}
+        env:
+          IMAGE: ${{ steps.registry.outputs.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        shell: bash
+        run: docker buildx imagetools create --tag "$IMAGE:latest" "$IMAGE@$DIGEST"
+
+      - name: Record container digest
+        env:
+          COMPONENT: ${{ matrix.component }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE: ${{ steps.registry.outputs.image }}
+        shell: bash
+        run: echo "${IMAGE}@${DIGEST}" > "${COMPONENT}-image-digest.txt"
+
+      - name: Upload container digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: storj-${{ inputs.release_tag }}-${{ matrix.component }}-image
+          path: ${{ matrix.component }}-image-digest.txt
+          if-no-files-found: error
+          retention-days: 7
+
   publish-release:
     name: Publish release assets
-    needs: build-binaries
+    needs:
+      - build-binaries
+      - publish-images
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -139,6 +345,12 @@ jobs:
       attestations: write
 
     steps:
+      - name: Check out release notes
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_ref }}
+          sparse-checkout: .github/releases
+
       - name: Download platform packages
         uses: actions/download-artifact@v7
         with:
@@ -157,7 +369,7 @@ jobs:
             exit 1
           fi
           cd release-assets
-          sha256sum ./*.zip | sort -k 2 > sha256sums
+          sha256sum ./*.zip ./*-image-digest.txt | sort -k 2 > sha256sums
 
       - name: Attest release packages
         id: attest
@@ -176,15 +388,32 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_NOTES: |
+            Custom build based on the corresponding Storj release. See the commit history for the exact differences from upstream.
+
+            Container images:
+
+            - `ghcr.io/aleksman4o/storagenode:${{ inputs.release_tag }}`
+            - `ghcr.io/aleksman4o/multinode:${{ inputs.release_tag }}`
+
+            These are immutable application images. Update them with `docker compose pull` followed by `docker compose up -d`; the container does not replace its bundled binary automatically.
+
+            Compactions can be scheduled and monitored with [Storj Compaction Orchestrator](https://github.com/Aleksman4o/storj-compaction-orchestrator).
         shell: bash
         run: |
           set -euo pipefail
           if ! gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            notes_file=".github/releases/${RELEASE_TAG}.md"
+            if [[ ! -f "$notes_file" ]]; then
+              printf '%s\n' "$RELEASE_NOTES" > "$RUNNER_TEMP/release-notes.md"
+              notes_file="$RUNNER_TEMP/release-notes.md"
+            fi
             gh release create "$RELEASE_TAG" \
               --repo "$GITHUB_REPOSITORY" \
               --verify-tag \
+              --draft \
               --title "$RELEASE_TAG" \
-              --notes "Custom build based on Storj. See the release notes for the changes from the corresponding upstream version."
+              --notes-file "$notes_file"
           fi
 
       - name: Upload canonical release assets
@@ -193,3 +422,10 @@ jobs:
           RELEASE_TAG: ${{ inputs.release_tag }}
         shell: bash
         run: gh release upload "$RELEASE_TAG" release-assets/* --repo "$GITHUB_REPOSITORY" --clobber
+
+      - name: Publish completed release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        shell: bash
+        run: gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false
