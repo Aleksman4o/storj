@@ -6,12 +6,12 @@ on:
       source_ref:
         description: Git tag containing the custom Storj source
         required: true
-        default: v1.165.6
+        default: v1.166.4
         type: string
       release_tag:
         description: GitHub release tag and embedded binary version
         required: true
-        default: v1.165.6
+        default: v1.166.4
         type: string
       publish_latest:
         description: Move the container image latest tags to this release
